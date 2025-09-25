@@ -117,6 +117,8 @@ async function initApp() {
   createLevels();
   createPlayerToken();
   renderControls();
+  renderRecenterButton();
+  enableFreeScroll(rootEl);
   refreshStates();
   centerCameraOnLevel(progress.current, true);
 }
@@ -329,6 +331,69 @@ function centerCameraOnLevel(level: number, instant = false) {
     return;
   }
   tween(world, { x: targetX, y: targetY }, 600, easeInOutCubic, syncBackground);
+}
+
+// ------- Free Scroll Support (wheel + drag) -------
+let isDragging = false;
+let dragStartY = 0;
+let worldStartY = 0;
+
+function clampCameraY(y: number) {
+  const minY = -(height - viewHeight);
+  return clamp(y, minY, 0);
+}
+
+function applyWorldY(y: number) {
+  world.position.y = y;
+  // sync background vertical position
+  backgroundLayer.y = world.position.y;
+}
+
+function enableFreeScroll(rootEl: HTMLElement) {
+  // Wheel scroll
+  rootEl.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = 1; // direct mapping for now
+    const newY = clampCameraY(world.position.y - e.deltaY * factor);
+    applyWorldY(newY);
+  }, { passive: false });
+
+  // Pointer drag (vertical only)
+  rootEl.addEventListener('pointerdown', (e) => {
+    if ((e.target as HTMLElement).closest('.modal,.controls,.nav-fab')) return; // ignore UI overlays
+    isDragging = true;
+    dragStartY = e.clientY;
+    worldStartY = world.position.y;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  });
+  rootEl.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dy = e.clientY - dragStartY;
+    const newY = clampCameraY(worldStartY + dy);
+    applyWorldY(newY);
+  });
+  const endDrag = (e: PointerEvent) => {
+    if (!isDragging) return;
+    isDragging = false;
+    try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch {}
+  };
+  rootEl.addEventListener('pointerup', endDrag);
+  rootEl.addEventListener('pointerleave', endDrag);
+}
+
+// ------- Recenter Button -------
+function renderRecenterButton() {
+  let existing = document.querySelector('.nav-fab');
+  if (!existing) {
+    const btn = document.createElement('button');
+    btn.className = 'nav-fab';
+    btn.type = 'button';
+    btn.title = 'Recenter on current level';
+    btn.ariaLabel = 'Recenter on current level';
+    btn.innerHTML = '⤓';
+    btn.addEventListener('click', () => centerCameraOnLevel(progress.current));
+    document.getElementById('app')?.appendChild(btn);
+  }
 }
 
 // Simple tween utility

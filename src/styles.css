@@ -145,3 +145,30 @@ body { width:100%; min-height:100dvh; }
 
 .fade-top { pointer-events:none; transition:opacity .4s ease; }
 .fade-top::after { display:none; }
+
+/* Floating recenter button */
+.nav-fab {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  border: 1px solid #2e3b47;
+  font-size: 1.35rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 14px -4px rgba(0,0,0,0.6);
+  backdrop-filter: blur(6px);
+  transition: background .25s, transform .25s;
+  z-index: 40;
+}
+.nav-fab:hover { background: rgba(0,0,0,0.7); transform: translateY(-3px); }
+.nav-fab:active { transform: translateY(0); }
+@media (max-width: 640px) {
+  .nav-fab { right: 12px; bottom: 12px; width: 44px; height: 44px; font-size:1.2rem; }
+}

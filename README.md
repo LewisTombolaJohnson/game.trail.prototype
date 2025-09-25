@@ -57,24 +57,29 @@ Reset via the Reset button or clearing site data.
 
 ## Deployment (GitHub Pages)
 
-This repo is configured to deploy from the `docs/` folder on the `main` branch.
+Automated GitHub Pages deployment is configured via the workflow at `.github/workflows/pages.yml`.
 
-1. Build the project:
-  ```bash
-  npm run deploy
-  ```
-2. Commit the generated `docs/` directory:
-  ```bash
-  git add docs
-  git commit -m "Build: deploy to pages"
-  git push origin main
-  ```
-3. In the GitHub repository settings ( Settings > Pages ), set:
-  - Source: Deploy from a branch
-  - Branch: `main` / `/docs`
-4. After it processes, access: `https://<your-username>.github.io/game.trail.prototype/`
+How it works:
+1. On every push to `main`, the action installs deps, runs `npm run build`, and uploads the `docs/` folder as the Pages artifact.
+2. The deploy job publishes that artifact to the GitHub Pages environment.
+3. The `.nojekyll` file in `docs/` ensures asset paths with leading underscores are not processed by Jekyll.
 
-If paths 404, confirm the `base` in `vite.config.ts` matches the repo name.
+Manual trigger:
+- You can also run it from the Actions tab with the "Run workflow" button.
+
+Local test before pushing:
+```bash
+npm run deploy   # builds into docs/
+npm run preview  # optional preview of production bundle
+```
+
+Expected URL pattern:
+```
+https://<your-username>.github.io/<repository-name>/
+```
+For this repo: `https://<your-username>.github.io/game.trail.prototype/`
+
+If you later change the repo name, update the `base` option in `vite.config.ts` so relative asset URLs resolve correctly on Pages.
 
 ## License
 MIT

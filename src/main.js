@@ -1,4 +1,6 @@
 import { Application, Container, Graphics, Text, TextStyle, Circle, Sprite, Assets } from 'pixi.js';
+// Import the jungle background so Vite rewrites the URL with correct base path & hashing
+import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards
  - Only ~8 levels visible via camera window height
@@ -108,6 +110,9 @@ async function initApp() {
     createLevels();
     createPlayerToken();
     renderControls();
+    renderRecenterButton();
+    enableFreeScroll(rootEl);
+    renderDice();
     refreshStates();
     centerCameraOnLevel(progress.current, true);
 }
@@ -139,12 +144,14 @@ let jungleTileHeight = 0; // cache for parallax bounds
 async function buildBackground() {
     // Clear previous tiles
     backgroundLayer.removeChildren();
+    // Single import-based path (lets Vite handle hashing & base prefix).
     if (!jungleTexture) {
         try {
-            jungleTexture = await Assets.load('assets/jungle/jungle_background.png');
+            jungleTexture = await Assets.load(jungleBackgroundUrl);
+            console.info('[background] Loaded jungle texture (import)', jungleBackgroundUrl);
         }
         catch (e) {
-            console.warn('Failed to load jungle background:', e);
+            console.warn('[background] Failed to load imported jungle texture:', jungleBackgroundUrl, e);
             return;
         }
     }
@@ -240,7 +247,7 @@ function createPlayerToken() {
     playerToken = c;
     positionPlayer(progress.current, true);
 }
-function positionPlayer(level, instant = false) {
+function positionPlayer(level, instant = false, duration = 600) {
     const pos = positions[level - 1];
     if (!playerToken)
         return;
@@ -249,7 +256,7 @@ function positionPlayer(level, instant = false) {
         playerToken.position.set(pos.x, targetY);
         return;
     }
-    tween(playerToken, { x: pos.x, y: targetY }, 600, easeInOutCubic);
+    tween(playerToken, { x: pos.x, y: targetY }, duration, easeInOutCubic);
 }
 function drawCircleForState(g, state) {
     g.clear();
@@ -296,6 +303,35 @@ function completeLevel(level) {
         centerCameraOnLevel(progress.current);
     }
 }
+// Advance multiple levels (e.g., via dice roll) with sequential animation
+function advanceBy(steps) {
+    if (steps <= 0)
+        return;
+    const remaining = Math.min(steps, LEVEL_COUNT - progress.current);
+    if (remaining <= 0)
+        return;
+    const sequence = [];
+    for (let i = 0; i < remaining; i++)
+        sequence.push(progress.current + 1 + i);
+    const stepDuration = 520; // ms per hop (camera tween 600 so shorten move tween)
+    function hop() {
+        if (!sequence.length)
+            return;
+        progress.current += 1;
+        saveProgress(progress);
+        refreshStates();
+        positionPlayer(progress.current, false, stepDuration - 50);
+        centerCameraOnLevel(progress.current);
+        if (sequence.length > 1) {
+            sequence.shift();
+            setTimeout(hop, stepDuration);
+        }
+        else {
+            sequence.shift();
+        }
+    }
+    hop();
+}
 // Camera logic: center around the player's current level keeping window of ~8 levels visible.
 // (Optional) Horizontal adjustment constant retained for fine tuning if the river artwork isn't perfectly centered.
 const RIVER_RELATIVE_X = 0.47; // 0.5 means centered; tweak slightly if needed (e.g., 0.48 / 0.52)
@@ -321,6 +357,69 @@ function centerCameraOnLevel(level, instant = false) {
         return;
     }
     tween(world, { x: targetX, y: targetY }, 600, easeInOutCubic, syncBackground);
+}
+// ------- Free Scroll Support (wheel + drag) -------
+let isDragging = false;
+let dragStartY = 0;
+let worldStartY = 0;
+function clampCameraY(y) {
+    const minY = -(height - viewHeight);
+    return clamp(y, minY, 0);
+}
+function applyWorldY(y) {
+    world.position.y = y;
+    // sync background vertical position
+    backgroundLayer.y = world.position.y;
+}
+function enableFreeScroll(rootEl) {
+    // Wheel scroll
+    rootEl.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const factor = 1; // direct mapping for now
+        const newY = clampCameraY(world.position.y - e.deltaY * factor);
+        applyWorldY(newY);
+    }, { passive: false });
+    // Pointer drag (vertical only)
+    rootEl.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.modal,.controls,.nav-fab'))
+            return; // ignore UI overlays
+        isDragging = true;
+        dragStartY = e.clientY;
+        worldStartY = world.position.y;
+        e.target.setPointerCapture(e.pointerId);
+    });
+    rootEl.addEventListener('pointermove', (e) => {
+        if (!isDragging)
+            return;
+        const dy = e.clientY - dragStartY;
+        const newY = clampCameraY(worldStartY + dy);
+        applyWorldY(newY);
+    });
+    const endDrag = (e) => {
+        if (!isDragging)
+            return;
+        isDragging = false;
+        try {
+            e.target.releasePointerCapture(e.pointerId);
+        }
+        catch { }
+    };
+    rootEl.addEventListener('pointerup', endDrag);
+    rootEl.addEventListener('pointerleave', endDrag);
+}
+// ------- Recenter Button -------
+function renderRecenterButton() {
+    let existing = document.querySelector('.nav-fab');
+    if (!existing) {
+        const btn = document.createElement('button');
+        btn.className = 'nav-fab';
+        btn.type = 'button';
+        btn.title = 'Recenter on current level';
+        btn.ariaLabel = 'Recenter on current level';
+        btn.innerHTML = '⤓';
+        btn.addEventListener('click', () => centerCameraOnLevel(progress.current));
+        document.getElementById('app')?.appendChild(btn);
+    }
 }
 function tween(target, to, duration, ease, onUpdate) {
     const fromX = target.x;
@@ -407,7 +506,7 @@ function ensureFadeOverlay(root) {
     fade.style.left = '0';
     // Expand 112px beyond the current game width to cover missing area on the right
     fade.style.right = 'auto';
-    fade.style.width = 'calc(100% + 124px)';
+    fade.style.width = 'calc(100%)';
     fade.style.margin = '0 auto';
     fade.style.height = '170px';
     fade.style.pointerEvents = 'none';
@@ -425,6 +524,46 @@ function handleResize() {
     // Ensure background locked to world after resize
     backgroundLayer.y = world.position.y;
     backgroundLayer.x = 0;
+}
+// ---------------- Dice Roll UI ----------------
+let isRolling = false;
+function renderDice() {
+    let bar = document.querySelector('.dice-bar');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.className = 'dice-bar';
+        bar.innerHTML = `
+      <div class="dice-wrapper">
+        <button type="button" class="dice-roll-btn" aria-label="Roll dice">Roll</button>
+        <div class="dice-face" aria-live="polite" aria-label="Dice result">-</div>
+      </div>`;
+        document.getElementById('app')?.appendChild(bar);
+        const rollBtn = bar.querySelector('.dice-roll-btn');
+        const face = bar.querySelector('.dice-face');
+        rollBtn.addEventListener('click', () => {
+            if (isRolling)
+                return;
+            if (progress.current >= LEVEL_COUNT) {
+                face.textContent = '🏁';
+                return;
+            }
+            isRolling = true;
+            rollBtn.disabled = true;
+            let ticks = 0;
+            const target = 1 + Math.floor(Math.random() * 6);
+            const spin = setInterval(() => {
+                ticks++;
+                face.textContent = String(1 + Math.floor(Math.random() * 6));
+                if (ticks >= 10) {
+                    clearInterval(spin);
+                    face.textContent = String(target);
+                    // Advance by rolled value
+                    advanceBy(target);
+                    setTimeout(() => { isRolling = false; rollBtn.disabled = false; }, 900);
+                }
+            }, 80);
+        });
+    }
 }
 // Kick off
 initApp();

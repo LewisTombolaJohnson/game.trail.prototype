@@ -119,6 +119,7 @@ async function initApp() {
   renderControls();
   renderRecenterButton();
   enableFreeScroll(rootEl);
+  renderDice();
   refreshStates();
   centerCameraOnLevel(progress.current, true);
 }
@@ -253,12 +254,12 @@ function createPlayerToken() {
   positionPlayer(progress.current, true);
 }
 
-function positionPlayer(level: number, instant = false) {
+function positionPlayer(level: number, instant = false, duration = 600) {
   const pos = positions[level - 1];
   if (!playerToken) return;
   const targetY = pos.y - 80; // offset above
   if (instant) { playerToken.position.set(pos.x, targetY); return; }
-  tween(playerToken, { x: pos.x, y: targetY }, 600, easeInOutCubic);
+  tween(playerToken, { x: pos.x, y: targetY }, duration, easeInOutCubic);
 }
 
 function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>) {
@@ -303,6 +304,31 @@ function completeLevel(level: number) {
     positionPlayer(progress.current);
     centerCameraOnLevel(progress.current);
   }
+}
+
+// Advance multiple levels (e.g., via dice roll) with sequential animation
+function advanceBy(steps: number) {
+  if (steps <= 0) return;
+  const remaining = Math.min(steps, LEVEL_COUNT - progress.current);
+  if (remaining <= 0) return;
+  const sequence: number[] = [];
+  for (let i = 0; i < remaining; i++) sequence.push(progress.current + 1 + i);
+  const stepDuration = 520; // ms per hop (camera tween 600 so shorten move tween)
+  function hop() {
+    if (!sequence.length) return;
+    progress.current += 1;
+    saveProgress(progress);
+    refreshStates();
+    positionPlayer(progress.current, false, stepDuration - 50);
+    centerCameraOnLevel(progress.current);
+    if (sequence.length > 1) {
+      sequence.shift();
+      setTimeout(hop, stepDuration);
+    } else {
+      sequence.shift();
+    }
+  }
+  hop();
 }
 
 // Camera logic: center around the player's current level keeping window of ~8 levels visible.
@@ -495,6 +521,43 @@ function handleResize() {
   // Ensure background locked to world after resize
   backgroundLayer.y = world.position.y;
   backgroundLayer.x = 0;
+}
+
+// ---------------- Dice Roll UI ----------------
+let isRolling = false;
+function renderDice() {
+  let bar = document.querySelector('.dice-bar');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.className = 'dice-bar';
+    bar.innerHTML = `
+      <div class="dice-wrapper">
+        <button type="button" class="dice-roll-btn" aria-label="Roll dice">Roll</button>
+        <div class="dice-face" aria-live="polite" aria-label="Dice result">-</div>
+      </div>`;
+    document.getElementById('app')?.appendChild(bar);
+    const rollBtn = bar.querySelector('.dice-roll-btn') as HTMLButtonElement;
+    const face = bar.querySelector('.dice-face') as HTMLDivElement;
+    rollBtn.addEventListener('click', () => {
+      if (isRolling) return;
+      if (progress.current >= LEVEL_COUNT) { face.textContent = '🏁'; return; }
+      isRolling = true;
+      rollBtn.disabled = true;
+      let ticks = 0;
+      const target = 1 + Math.floor(Math.random() * 6);
+      const spin = setInterval(() => {
+        ticks++;
+        face.textContent = String(1 + Math.floor(Math.random()*6));
+        if (ticks >= 10) {
+          clearInterval(spin);
+          face.textContent = String(target);
+          // Advance by rolled value
+          advanceBy(target);
+          setTimeout(() => { isRolling = false; rollBtn.disabled = false; }, 900);
+        }
+      }, 80);
+    });
+  }
 }
 
 // Kick off

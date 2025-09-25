@@ -1,4 +1,6 @@
 import { Application, Container, Graphics, Text, TextStyle, Circle, Sprite, Texture, Assets } from 'pixi.js';
+// Import the jungle background so Vite rewrites the URL with correct base path & hashing
+import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
 
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards
@@ -148,32 +150,15 @@ let jungleTileHeight = 0; // cache for parallax bounds
 async function buildBackground() {
   // Clear previous tiles
   backgroundLayer.removeChildren();
-  // Lazy load (with multi-path fallback) only once
+  // Single import-based path (lets Vite handle hashing & base prefix).
   if (!jungleTexture) {
-    const candidatePaths = [
-      'assets/jungle/jungle_background.png', // dev path (original source tree)
-      'jungle/jungle_background.png',        // GitHub Pages output (observed in docs/)
-      './assets/jungle/jungle_background.png',
-      './jungle/jungle_background.png'
-    ];
-    let loaded: Texture | null = null;
-    for (const p of candidatePaths) {
-      try {
-        loaded = await Assets.load(p);
-        if (loaded) {
-          console.info('[background] Loaded jungle texture from', p);
-          break;
-        }
-      } catch (err) {
-        // Try next
-        console.debug('[background] Path failed, trying next:', p, err);
-      }
-    }
-    if (!loaded) {
-      console.warn('[background] Unable to load jungle background from any candidate path.');
+    try {
+      jungleTexture = await Assets.load(jungleBackgroundUrl);
+      console.info('[background] Loaded jungle texture (import)', jungleBackgroundUrl);
+    } catch (e) {
+      console.warn('[background] Failed to load imported jungle texture:', jungleBackgroundUrl, e);
       return;
     }
-    jungleTexture = loaded;
   }
   if (!jungleTexture) return;
   // Expand tile width slightly to avoid edge gaps when camera recenters horizontally

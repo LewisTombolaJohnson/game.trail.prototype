@@ -148,13 +148,32 @@ let jungleTileHeight = 0; // cache for parallax bounds
 async function buildBackground() {
   // Clear previous tiles
   backgroundLayer.removeChildren();
+  // Lazy load (with multi-path fallback) only once
   if (!jungleTexture) {
-    try {
-      jungleTexture = await Assets.load('assets/jungle/jungle_background.png');
-    } catch (e) {
-      console.warn('Failed to load jungle background:', e);
+    const candidatePaths = [
+      'assets/jungle/jungle_background.png', // dev path (original source tree)
+      'jungle/jungle_background.png',        // GitHub Pages output (observed in docs/)
+      './assets/jungle/jungle_background.png',
+      './jungle/jungle_background.png'
+    ];
+    let loaded: Texture | null = null;
+    for (const p of candidatePaths) {
+      try {
+        loaded = await Assets.load(p);
+        if (loaded) {
+          console.info('[background] Loaded jungle texture from', p);
+          break;
+        }
+      } catch (err) {
+        // Try next
+        console.debug('[background] Path failed, trying next:', p, err);
+      }
+    }
+    if (!loaded) {
+      console.warn('[background] Unable to load jungle background from any candidate path.');
       return;
     }
+    jungleTexture = loaded;
   }
   if (!jungleTexture) return;
   // Expand tile width slightly to avoid edge gaps when camera recenters horizontally

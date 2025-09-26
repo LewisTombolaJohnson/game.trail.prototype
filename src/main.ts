@@ -38,6 +38,36 @@ const MINIGAMES: MinigameId[] = ['stop_bar','coin_flip','rps','memory_flip','slo
 const MINIGAME_ASSIGN_KEY = 'minigameAssignmentsV1';
 const CURRENCY_KEY = 'currenciesV1';
 const CATEGORY_ASSIGN_KEY = 'categoryAssignmentsV1';
+const DAY_STATE_KEY = 'dayStateV1';
+const STREAK_STATE_KEY = 'streakStateV1';
+
+interface DayState { day: number; rollUsed: boolean }
+let dayState: DayState = { day: 1, rollUsed: false };
+function loadDayState(){
+  try {
+    const raw = localStorage.getItem(DAY_STATE_KEY);
+    if(!raw) return;
+    const data = JSON.parse(raw);
+    if(typeof data.day==='number' && data.day>=1 && typeof data.rollUsed==='boolean'){
+      dayState.day = Math.floor(data.day);
+      dayState.rollUsed = data.rollUsed;
+    }
+  } catch {}
+}
+function saveDayState(){ localStorage.setItem(DAY_STATE_KEY, JSON.stringify(dayState)); }
+
+// Streak state (consecutive days where roll was used before advancing day)
+interface StreakState { streak: number }
+let streakState: StreakState = { streak: 0 };
+function loadStreakState(){
+  try {
+    const raw = localStorage.getItem(STREAK_STATE_KEY);
+    if(!raw) return;
+    const data = JSON.parse(raw);
+    if(typeof data.streak==='number' && data.streak>=0){ streakState.streak = Math.floor(data.streak); }
+  } catch {}
+}
+function saveStreakState(){ localStorage.setItem(STREAK_STATE_KEY, JSON.stringify(streakState)); }
 
 // Category assignments (supersede classic minigame-only approach)
 let categoryAssignments: CategoryAssignment[] = [];
@@ -48,6 +78,17 @@ function loadCategoryAssignments(): boolean {
     const arr = JSON.parse(raw);
     if(Array.isArray(arr)){
       categoryAssignments = arr.filter(a=> typeof a.level==='number' && a.level>=1 && a.level<=LEVEL_COUNT && typeof a.category==='string');
+      // Migration: remove direct movement tiles (extra_move/travel_back) so they only appear via mystery resolution
+      let migrated = false;
+      categoryAssignments.forEach(a=>{
+        if((a.category==='extra_move' || a.category==='travel_back')){
+          // Convert to unresolved mystery tile unless already completed; keep completion state if it was completed
+          a.resolvedAs = undefined;
+          a.category = 'mystery';
+          migrated = true;
+        }
+      });
+      if(migrated) saveCategoryAssignments();
       return true;
     }
   } catch {}
@@ -61,14 +102,14 @@ function generateCategoryAssignments(){
   const mgLevels = shuffle(levels.slice(1)).slice(0, MINIGAMES.length);
   const used = new Set<number>(mgLevels);
   const assignments: CategoryAssignment[] = mgLevels.map((lvl,i)=>({ level:lvl, category:'minigame', minigame: MINIGAMES[i], completed:false }));
-  // Mandatory categories ensure coverage
-  const mandatory: CategoryId[] = ['instant_tokens','instant_prize','reveal','bonus_round','mystery','extra_move','travel_back'];
+  // Mandatory categories ensure coverage (movement tiles removed from direct pool; only appear via mystery resolution)
+  const mandatory: CategoryId[] = ['instant_tokens','instant_prize','reveal','bonus_round','mystery'];
   const remain = shuffle(levels.slice(1).filter(l=> !used.has(l))); // keep level 1 separate
   mandatory.forEach((cat,i)=>{ if(remain[i]!==undefined){ assignments.push({ level: remain[i], category: cat }); used.add(remain[i]); } });
   // Level 1 always a simple instant token tile
   assignments.push({ level:1, category:'instant_tokens', completed:false }); used.add(1);
-  // Fill gaps
-  const fillPool: CategoryId[] = ['instant_tokens','instant_prize','reveal','mystery','extra_move','travel_back','minigame'];
+  // Fill gaps (movement categories removed from direct generation)
+  const fillPool: CategoryId[] = ['instant_tokens','instant_prize','reveal','mystery','minigame'];
   levels.forEach(l=>{
     if(!used.has(l)){
       const cat = fillPool[Math.floor(Math.random()*fillPool.length)];
@@ -281,6 +322,8 @@ app.stage.addChild(world);
 
 async function initApp() {
   loadCurrencies();
+  loadDayState();
+  loadStreakState();
   ensureCategoryAssignments(); // new category system (includes embedded minigames)
   await app.init({ backgroundAlpha: 0, antialias: true, width: viewWidth, height: viewHeight, autoDensity: true });
   const rootEl = document.getElementById('pixi-root');
@@ -440,12 +483,12 @@ function positionPlayer(level: number, instant = false, duration = 600) {
 
 function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>) {
   g.clear();
-  // Color scheme update:
-  // completed -> green, current -> accent orange, unlocked -> neutral (light gray), locked -> darker gray
+  // Fallback (should rarely render because all tiles have categories). We no longer color passed tiles green;
+  // only explicit category completion will render green via drawCategoryShape.
   let fill = 0x3d444c; // locked base
-  if (state === 'completed') fill = 0x4caf50; // green for completed
-  else if (state === 'current') fill = 0xff9f43; // accent
-  else if (state === 'unlocked') fill = 0x5a6470; // neutral mid tone (no green highlight)
+  if (state === 'current') fill = 0xff9f43; // accent for current
+  else if (state === 'unlocked') fill = 0x5a6470; // upcoming next tile
+  else if (state === 'completed') fill = 0x46525d; // previously passed but unresolved (neutral, not green)
   (g as any).lineStyle(4, 0x182028, 1);
   g.beginFill(fill);
   g.drawCircle(0, 0, TILE_RADIUS);
@@ -455,8 +498,11 @@ function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>)
 function drawCategoryShape(g:Graphics, assign:CategoryAssignment){
   g.clear();
   const state = computeState(assign.level);
-  let fill = 0x3d444c;
-  if(assign.completed) fill=0x4caf50; else if(state==='completed') fill=0x4caf50; else if(state==='current') fill=0xff9f43; else if(state==='unlocked') fill=0x5a6470;
+  let fill = 0x3d444c; // default locked / future
+  if(assign.completed) fill = 0x4caf50; // only true category completion is green
+  else if(state==='current') fill = 0xff9f43; // current tile
+  else if(state==='unlocked') fill = 0x5a6470; // immediate next tile
+  else if(state==='completed') fill = 0x46525d; // passed but not resolved (neutral)
   (g as any).lineStyle(4,0x182028,1);
   g.beginFill(fill);
   const r = TILE_RADIUS;
@@ -525,10 +571,12 @@ function completeLevel(level: number) {
   if (progress.current < LEVEL_COUNT) {
     progress.current += 1;
     saveProgress(progress);
-    addTokens(1); // award token per completed level
+    // Removed automatic token award (tokens now only from rewards)
     refreshStates();
     positionPlayer(progress.current);
     centerCameraOnLevel(progress.current);
+    // Auto-trigger the newly reached tile's category effect after manual completion advance
+    setTimeout(()=>{ maybeAutoTriggerCategory(); }, 650);
   }
 }
 
@@ -544,7 +592,7 @@ function advanceBy(steps: number) {
     if (!sequence.length) return;
     progress.current += 1;
     saveProgress(progress);
-    addTokens(1); // award per hop
+    // Removed per-hop token award (tokens now only from explicit rewards)
     refreshStates();
     positionPlayer(progress.current, false, stepDuration - 50);
     centerCameraOnLevel(progress.current);
@@ -576,20 +624,28 @@ function retreatBy(steps:number){
     refreshStates();
     positionPlayer(progress.current, false, stepDuration - 60);
     centerCameraOnLevel(progress.current);
-    if(sequence.length>1){ sequence.shift(); setTimeout(hop, stepDuration); } else sequence.shift();
+    if(sequence.length>1){
+      sequence.shift();
+      setTimeout(hop, stepDuration);
+    } else {
+      sequence.shift();
+      // Final landing after retreat chain
+      setTimeout(()=>{ maybeAutoTriggerCategory(); }, stepDuration + 120);
+    }
   }
   hop();
 }
 
-// Auto-trigger category behaviour (currently only minigame auto-open)
+// Auto-trigger category behaviour for ANY category when landing on a tile (dice advance, retreat, extra move, manual completion)
 function maybeAutoTriggerCategory(){
-  const catAssign = getCategoryAssignment(progress.current);
-  if(!catAssign) return;
-  if(catAssign.category==='minigame' && catAssign.minigame){
-    let mg = getAssignmentForLevel(catAssign.level);
-    if(!mg){ mg = { level: catAssign.level, game: catAssign.minigame, completed: !!catAssign.completed }; minigameAssignments.push(mg); saveMinigameAssignments(); }
-    if(!mg.completed) openMinigameModal(mg);
-  }
+  const level = progress.current;
+  const assign = getCategoryAssignment(level);
+  if(!assign) return; // no category assigned (fallback placeholder)
+  if(assign.completed) return; // already resolved
+  // Close any existing modal before opening a new one (safety)
+  closeModal();
+  // Use standard interaction pipeline (manual=false)
+  triggerCategoryInteraction(level,false);
 }
 
 // Camera logic: center around the player's current level keeping window of ~8 levels visible.
@@ -731,12 +787,17 @@ function renderControls() {
     controls.className = 'controls';
     controls.innerHTML = `
       <div class="currency-bar" aria-label="Currencies">
+        <div class="currency day-counter pill" title="Current Day"><span class="label">Day</span><span class="day-count">1</span></div>
+  <div class="currency streak-counter pill" title="Daily Streak (consecutive active days)"><span class="label">Streak</span><span class="streak-count">0</span></div>
         <div class="currency token-counter pill"><img src="${tokenIconUrl}" alt="Token" class="token-icon" /><span class="token-count">0</span></div>
         <div class="currency fp-counter pill" title="Free Plays"><span class="label">FP</span><span class="fp-count">0</span></div>
         <div class="currency cash-counter pill" title="Cash Balance"><span class="label">💰</span><span class="cash-count">0</span></div>
         <div class="currency bonus-counter pill" title="Bonus Money"><span class="label">BM</span><span class="bonus-count">0</span></div>
       </div>
-      <button type="button" data-action="reset" class="reset" aria-label="Reset progress">Reset</button>`;
+      <div class="control-row" style="display:flex;gap:8px;margin-top:6px;">
+        <button type="button" data-action="roll-next-day" class="next-day" aria-label="Advance to next day">Next Day</button>
+        <button type="button" data-action="reset" class="reset" aria-label="Reset progress">Reset</button>
+      </div>`;
     document.getElementById('app')?.appendChild(controls);
     // Floating legend button (only once)
     if(!document.querySelector('.legend-fab')){
@@ -756,6 +817,17 @@ function renderControls() {
         .currency-bar .cash-counter .label{font-size:15px;line-height:1;} 
         .currency-bar img.token-icon{width:18px;height:18px;display:block;}
         .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
+        .controls button.next-day{background:#304050;color:#fff;border:1px solid #456075;padding:8px 14px;font-weight:600;border-radius:10px;cursor:pointer;transition:background .25s,box-shadow .25s;}
+        .controls button.next-day:disabled{opacity:.35;cursor:default;box-shadow:none;}
+        .controls button.next-day.ready{box-shadow:0 0 0 2px #ff9f43 inset,0 0 10px 2px rgba(255,159,67,0.55);}
+        .controls button.reset{background:#402c2c;color:#fff;border:1px solid #664242;padding:8px 14px;font-weight:600;border-radius:10px;cursor:pointer;}
+        .dice-bar .dice-btn.daily-used{background:#3a3f44 !important;border:0;color:#888;box-shadow:inset 0 0 0 2px #555;position:relative;}
+        .dice-bar .dice-btn.daily-used::after{content:'Daily used';position:absolute;bottom:-18px;left:50%;transform:translateX(-50%);font-size:10px;font-weight:600;color:#bbb;letter-spacing:.5px;}
+        @keyframes diceGlow{0%,100%{box-shadow:0 0 0 4px rgba(255,159,67,0.25),0 0 18px 4px rgba(255,159,67,0.55);}50%{box-shadow:0 0 0 2px rgba(255,159,67,0.55),0 0 10px 2px rgba(255,159,67,0.9);}}
+        @keyframes diceShake{0%,100%{transform:translateY(-3px) rotateZ(-3deg);}25%{transform:translate(-3px,1px) rotateZ(5deg);}50%{transform:translate(3px,-2px) rotateZ(-6deg);}75%{transform:translate(-2px,2px) rotateZ(4deg);}}
+        .dice-cube.can-roll{animation:diceGlow 2.8s ease-in-out infinite;position:relative;}
+        .dice-cube.can-roll::after{content:'Roll!';position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:11px;font-weight:600;color:#ffcf9a;letter-spacing:.5px;text-shadow:0 1px 2px #000;}
+        .dice-cube.spinning{animation:diceShake 0.65s linear infinite;}
       `;
       document.head.appendChild(style);
     }
@@ -764,13 +836,30 @@ function renderControls() {
     if (confirm('Reset your progress?')) {
       progress.current = 1;
       saveProgress(progress);
+      // Clear completion / resolution on all category & minigame assignments so no tiles stay green
+      categoryAssignments.forEach(a=>{ a.completed = false; if(a.category==='mystery'){ delete a.resolvedAs; } });
+      saveCategoryAssignments();
+      minigameAssignments.forEach(m=>{ m.completed = false; });
+      saveMinigameAssignments();
+      // Reset currencies (tokens & others)
+      tokens = 0; saveTokens();
+      freePlays = 0; cashPence = 0; bonusPence = 0; saveCurrencies();
+      updateCurrencyCounters();
+      // Reset day state too & re-enable roll
+      dayState.day = 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
+      // Reset streak state
+      streakState.streak = 0; saveStreakState(); updateStreakUI();
       refreshStates();
       positionPlayer(progress.current, true);
       centerCameraOnLevel(progress.current, true);
     }
   });
+  controls.querySelector('[data-action="roll-next-day"]')?.addEventListener('click', ()=>{
+    advanceDayWithTransition();
+  });
   updateResetButton();
   updateTokenCounter();
+  updateDayUI();
 }
 function updateResetButton() { const btn = document.querySelector('[data-action="reset"]') as HTMLButtonElement | null; if (btn) btn.disabled = progress.current === 1; }
 
@@ -780,6 +869,31 @@ function updateCurrencyCounters(){
   const fp = document.querySelector('.fp-count'); if(fp) fp.textContent = String(freePlays);
   const cash = document.querySelector('.cash-count'); if(cash) cash.textContent = formatCash(cashPence);
   const bonus = document.querySelector('.bonus-count'); if(bonus) bonus.textContent = formatCash(bonusPence);
+}
+function updateDayUI(){
+  const daySpan = document.querySelector('.day-count'); if(daySpan) daySpan.textContent = String(dayState.day);
+  updateStreakUI();
+  const rollBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null; 
+  if(rollBtn){
+    if(dayState.rollUsed){
+      rollBtn.classList.add('daily-used');
+      rollBtn.classList.remove('can-roll');
+      rollBtn.disabled = true; // ensure disabled attribute
+    } else {
+      rollBtn.classList.remove('daily-used');
+      rollBtn.classList.add('can-roll');
+      if(!isRolling) rollBtn.disabled = false;
+    }
+  }
+  const nextBtn = document.querySelector('[data-action="roll-next-day"]') as HTMLButtonElement | null;
+  if(nextBtn){
+    if(dayState.rollUsed){ nextBtn.disabled = false; nextBtn.classList.add('ready'); }
+    else { nextBtn.disabled = true; nextBtn.classList.remove('ready'); }
+  }
+}
+
+function updateStreakUI(){
+  const streakSpan = document.querySelector('.streak-count'); if(streakSpan) streakSpan.textContent = String(streakState.streak);
 }
 
 function openModal(level: number) {
@@ -901,7 +1015,8 @@ function updateDebugOverlay() {
     `paddings T:${TOP_VISIBLE_PADDING} B:${BOTTOM_VISIBLE_PADDING}\n` +
     `camera: (${camX}, ${camY})\n` +
     `progress: ${current}/${LEVEL_COUNT} visible:${visibleRange}\n` +
-    `minigames: ${mgCount}`;
+  `minigames: ${mgCount}\n`+
+  `day: ${dayState.day} rollUsed:${dayState.rollUsed} streak:${streakState.streak}`;
 }
 
 // ---------------- Minigame Modals ----------------
@@ -947,7 +1062,12 @@ function completeMinigame(assign:MinigameAssignment, success:boolean, resultEl:H
     if(reward.kind==='nothing') msg = '<p><strong>No reward this time.</strong></p>';
     else { applyReward(reward); msg = `<p><strong>Reward:</strong> ${reward.label}</p>`; }
   } else msg = '<p><strong>Try again tomorrow!</strong></p>';
-  assign.completed = true; saveMinigameAssignments(); refreshStates();
+  assign.completed = true;
+  saveMinigameAssignments();
+  // Also mark the overarching category assignment as completed so the tile turns green (played out)
+  const catAssign = getCategoryAssignment(assign.level);
+  if(catAssign && !catAssign.completed){ catAssign.completed = true; saveCategoryAssignments(); }
+  refreshStates();
   resultEl.innerHTML = msg;
 }
 
@@ -1092,35 +1212,33 @@ function renderDice() {
     bar = document.createElement('div');
     bar.className = 'dice-bar';
     bar.innerHTML = `
-      <div class="dice-wrapper" style="display:flex;align-items:flex-end;gap:24px;">
-        <div class="dice-buttons" style="display:flex;flex-direction:row;gap:12px;">
-          <button type="button" class="dice-btn dice-roll-btn" aria-label="Roll" title="Roll">Roll</button>
-          <button type="button" class="dice-btn dice-retreat-btn" aria-label="Reverse-Roll" title="Reverse-Roll">Reverse-Roll</button>
-        </div>
-        <div class="dice-face shared" aria-live="polite" aria-label="Dice result">-</div>
+      <div class="dice-wrapper" style="display:flex;align-items:center;justify-content:center;">
+        <button type="button" class="dice-cube dice-roll-btn" aria-label="Roll Dice" title="Roll Dice">-</button>
       </div>`;
     document.getElementById('app')?.appendChild(bar);
     const rollBtn = bar.querySelector('.dice-roll-btn') as HTMLButtonElement;
-    const sharedFace = bar.querySelector('.dice-face.shared') as HTMLDivElement;
-    const revBtn = bar.querySelector('.dice-retreat-btn') as HTMLButtonElement;
+    const sharedFace = rollBtn; // rolled value appears on the dice itself
     // Style injection for dice if missing
     if(!document.getElementById('dice-style')){
       const style = document.createElement('style');
       style.id='dice-style';
       style.textContent = `.dice-bar{display:flex;justify-content:center;margin-top:6px;}
-        .dice-btn{background:#ff9f43;border:0;color:#111;padding:10px 16px;font-weight:700;border-radius:10px;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.4);transition:transform .15s,background .2s;}
-        .dice-btn:disabled{opacity:.5;cursor:default;}
-        .dice-btn:hover:not(:disabled){transform:translateY(-2px);}
-        .dice-face.shared{min-width:48px;min-height:48px;background:#222;border:3px solid #ff9f43;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#fff;}
+        .dice-cube{width:72px;height:72px;background:#222;border:4px solid #ff9f43;border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;cursor:pointer;box-shadow:0 4px 10px rgba(0,0,0,0.5);transition:transform .18s, background .25s, box-shadow .25s;}
+        .dice-cube:hover:not(:disabled){transform:translateY(-3px) rotateZ(-3deg);}
+        .dice-cube:disabled{opacity:.55;cursor:default;}
+        .dice-cube.daily-used{background:#3a3f44 !important;color:#888;box-shadow:inset 0 0 0 3px #555;}
+        .dice-cube.daily-used::after{content:'Daily used';position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:11px;font-weight:600;color:#bbb;letter-spacing:.5px;}
       `;
       document.head.appendChild(style);
     }
     rollBtn.addEventListener('click', () => {
       if (isRolling) return;
       if (progress.current >= LEVEL_COUNT) { sharedFace.textContent = '🏁'; return; }
+      if(dayState.rollUsed){ return; }
       isRolling = true;
       rollBtn.disabled = true;
-      revBtn.disabled = true;
+      rollBtn.classList.remove('can-roll');
+      rollBtn.classList.add('spinning');
       let ticks = 0;
       const target = 1 + Math.floor(Math.random() * 6);
       const spin = setInterval(() => {
@@ -1129,24 +1247,9 @@ function renderDice() {
         if (ticks >= 10) {
           clearInterval(spin);
           sharedFace.textContent = String(target);
-          // Advance by rolled value
           advanceBy(target);
-          setTimeout(() => { isRolling = false; rollBtn.disabled = false; revBtn.disabled=false; }, 900);
-        }
-      }, 80);
-    });
-    revBtn.addEventListener('click', () => {
-      if(isRolling) return;
-      if(progress.current<=1){ sharedFace.textContent='⛔'; return; }
-      isRolling = true; revBtn.disabled = true; rollBtn.disabled = true;
-      let ticks=0; const target = 1 + Math.floor(Math.random()*6);
-      const spin = setInterval(()=>{
-        ticks++; sharedFace.textContent = String(1 + Math.floor(Math.random()*6));
-        if(ticks>=10){
-          clearInterval(spin);
-            sharedFace.textContent = String(target);
-            retreatBy(target);
-            setTimeout(()=>{ isRolling=false; revBtn.disabled=false; rollBtn.disabled=false; maybeAutoTriggerCategory(); }, 900);
+          dayState.rollUsed = true; saveDayState(); updateDayUI();
+          setTimeout(() => { isRolling = false; rollBtn.classList.remove('spinning'); updateDayUI(); }, 900);
         }
       }, 80);
     });
@@ -1300,3 +1403,42 @@ function openMoveChainModal(assign:CategoryAssignment, forward:boolean){
 
 // Kick off
 initApp();
+
+// ---------------- Day Transition / Advancement ----------------
+function ensureDayFader(){
+  let el = document.getElementById('day-fader');
+  if(!el){
+    el = document.createElement('div');
+    el.id='day-fader';
+    Object.assign(el.style,{position:'fixed',left:'0',top:'0',right:'0',bottom:'0',background:'#000',opacity:'0',transition:'opacity 420ms ease',zIndex:'9998',pointerEvents:'none'});
+    document.body.appendChild(el);
+  }
+  return el as HTMLDivElement;
+}
+function advanceDayWithTransition(){
+  const fader = ensureDayFader();
+  fader.style.pointerEvents='auto';
+  const labelId = 'day-fader-label';
+  let label = document.getElementById(labelId) as HTMLDivElement | null;
+  if(!label){
+    label = document.createElement('div');
+    label.id = labelId;
+    Object.assign(label.style,{position:'absolute',left:'50%',top:'50%',transform:'translate(-50%,-50%)',color:'#fff',fontSize:'48px',fontWeight:'700',fontFamily:'system-ui, sans-serif',textShadow:'0 4px 12px rgba(0,0,0,0.6)',opacity:'0',transition:'opacity 500ms ease'});
+    fader.appendChild(label);
+  }
+  requestAnimationFrame(()=>{ fader.style.opacity='1'; });
+  // After fade-in completes, increment day, show label for 3s, then fade out.
+  setTimeout(()=>{
+    // Streak logic: only increment if the roll was actually used before advancing
+    if(dayState.rollUsed){ streakState.streak += 1; }
+    else { streakState.streak = 0; }
+    saveStreakState();
+    dayState.day += 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
+    if(label){ label.textContent = `Day ${dayState.day}`; label.style.opacity='1'; }
+    setTimeout(()=>{
+      if(label) label.style.opacity='0';
+      fader.style.opacity='0';
+      setTimeout(()=>{ fader.style.pointerEvents='none'; }, 500);
+    }, 3000); // hold 3 seconds
+  }, 500);
+}

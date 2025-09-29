@@ -1,5 +1,6 @@
 import { Application, Container, Graphics, Text, TextStyle, Circle, Sprite, Texture, Assets } from 'pixi.js';
 import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
+import carnivalBackgroundUrl from '../assets/carnival/carnival_background.png';
 import tokenIconUrl from '../assets/general/token.svg';
 
 /* Vertical Candy-Crush-like Trail
@@ -20,6 +21,16 @@ let BOTTOM_VISIBLE_PADDING = 260; // includes dice bar clearance
 // Dynamic tile radius (updated on viewport compute) so tiles scale slightly on small screens but capped on large.
 let TILE_RADIUS = 38; // default; recomputed each resize
 
+// ---------------- Zones ----------------
+// Zone 1: Jungle (levels 1-14) | Zone 2: Carnival (levels 15-30)
+const ZONE_BOUNDARY_LEVEL = 15; // entering this level begins Carnival zone
+interface ZoneDef { id: string; startLevel: number; bgTexture?: Texture|null; }
+const ZONES: ZoneDef[] = [
+  { id: 'Jungle', startLevel: 1 },
+  { id: 'Carnival', startLevel: ZONE_BOUNDARY_LEVEL }
+];
+let currentZoneId = 'Jungle';
+
 interface ProgressState { current: number }
 interface LevelPos { x: number; y: number }
 interface ManualPatternNode { x: number; yOffset?: number }
@@ -27,14 +38,14 @@ interface LevelNode { level: number; container: Container; circle: Graphics; lab
 interface Connector { from: number; to: number; line: Graphics }
 
 // ---------------- Minigame, Category & Rewards Types ----------------
-type MinigameId = 'stop_bar' | 'coin_flip' | 'rps' | 'memory_flip' | 'slot' | 'spin_wheel';
+type MinigameId = 'slot' | 'spin_wheel' | 'lootbox';
 interface MinigameAssignment { level: number; game: MinigameId; completed: boolean; }
 interface Reward { kind: 'tokens' | 'freePlays' | 'cash' | 'bonus' | 'nothing'; amount?: number; label: string }
 // New tile categories replacing empties
 type CategoryId = 'instant_tokens' | 'instant_prize' | 'reveal' | 'minigame' | 'bonus_round' | 'mystery' | 'extra_move' | 'travel_back';
 interface CategoryAssignment { level:number; category: CategoryId; minigame?: MinigameId; completed?: boolean; resolvedAs?: CategoryId }
 
-const MINIGAMES: MinigameId[] = ['stop_bar','coin_flip','rps','memory_flip','slot','spin_wheel'];
+const MINIGAMES: MinigameId[] = ['slot','spin_wheel','lootbox'];
 const MINIGAME_ASSIGN_KEY = 'minigameAssignmentsV1';
 const CURRENCY_KEY = 'currenciesV1';
 const CATEGORY_ASSIGN_KEY = 'categoryAssignmentsV1';
@@ -89,6 +100,9 @@ function loadCategoryAssignments(): boolean {
         }
       });
       if(migrated) saveCategoryAssignments();
+      if(categoryAssignments.length===0){
+        return false; // force regeneration
+      }
       return true;
     }
   } catch {}
@@ -171,7 +185,16 @@ function loadMinigameAssignments() {
     if (!raw) return false;
     const arr = JSON.parse(raw);
     if (Array.isArray(arr)) {
-      minigameAssignments = arr.filter(a => MINIGAMES.includes(a.game) && typeof a.level === 'number');
+      const filtered = arr.filter(a => a && typeof a.level === 'number' && MINIGAMES.includes(a.game));
+      const removed = arr.length - filtered.length;
+      // If after filtering we don't have a full set for current roster, regenerate fresh to spread them out
+      if (filtered.length < MINIGAMES.length) {
+        generateMinigameAssignments();
+        return true;
+      }
+      minigameAssignments = filtered;
+      // Persist sanitized list if anything was removed
+      if (removed > 0) saveMinigameAssignments();
       return true;
     }
   } catch {}
@@ -310,8 +333,11 @@ let height = Math.max(1600, Math.max(...positions.map(p=>p.y))+400);
 
 const app = new Application();
 
-// Background layer (will parallax scroll vertically with world; stays decoupled horizontally)
-const backgroundLayer = new Container(); // jungle tiles (now locked to world movement: no parallax)
+// Background layers (each zone gets its own tiled container for cross-fade)
+const backgroundLayer = new Container(); // parent
+const jungleLayer = new Container();
+const carnivalLayer = new Container();
+backgroundLayer.addChild(jungleLayer, carnivalLayer);
 const world = new Container(); // moves with camera
 const trailLayer = new Container();
 const levelLayer = new Container();
@@ -370,37 +396,38 @@ function buildTrail() {
 
 // --- Jungle background tiling ---
 let jungleTexture: Texture | null = null;
-let jungleTileHeight = 0; // cache for parallax bounds
+let carnivalTexture: Texture | null = null;
+let jungleTileHeight = 0;
+let carnivalTileHeight = 0;
+
 async function buildBackground() {
-  backgroundLayer.removeChildren();
-  if (!jungleTexture) {
-    try {
-      jungleTexture = await Assets.load(jungleBackgroundUrl);
-      console.info('[background] Loaded jungle texture (import)', jungleBackgroundUrl);
-    } catch (e) {
-      console.warn('[background] Failed to load imported jungle texture:', jungleBackgroundUrl, e);
-      return;
+  jungleLayer.removeChildren();
+  carnivalLayer.removeChildren();
+  if(!jungleTexture){ try { jungleTexture = await Assets.load(jungleBackgroundUrl);} catch(e){ console.warn('Failed to load jungle', e); } }
+  if(!carnivalTexture){ try { carnivalTexture = await Assets.load(carnivalBackgroundUrl);} catch(e){ console.warn('Failed to load carnival', e); } }
+  const OVERDRAW_X = 100;
+  const HEIGHT_MULT = 1.28;
+  const tileW = viewWidth + OVERDRAW_X;
+  function tileLayer(tex:Texture|null, layer:Container, storeHeight:(h:number)=>void){
+    if(!tex) return;
+    const scale = tileW / tex.width;
+    const tileH = Math.round(tex.height * scale * HEIGHT_MULT);
+    if(tileH<=0) return;
+    storeHeight(tileH);
+    const totalH = height + viewHeight + tileH;
+    for(let y=0;y<totalH;y+=tileH){
+      const s = new Sprite(tex);
+      s.x = -(OVERDRAW_X/2);
+      s.y = y;
+      s.width = tileW;
+      s.height = tileH;
+      s.alpha = 1;
+      layer.addChild(s);
     }
   }
-  if (!jungleTexture) return;
-  // Cover scaling: stretch width to full view width + small overdraw, then scale height proportionally with multiplier.
-  const OVERDRAW_X = 100; // horizontal extra so edges never show when rounding
-  const HEIGHT_MULT = 1.28; // stretch vertically to reduce visible repetition & align with fade
-  const tileW = viewWidth + OVERDRAW_X;
-  const scale = tileW / jungleTexture.width;
-  const tileH = Math.round(jungleTexture.height * scale * HEIGHT_MULT);
-  if (tileH <= 0) return;
-  jungleTileHeight = tileH;
-  const totalH = height + viewHeight + tileH;
-  for (let y = 0; y < totalH; y += tileH) {
-    const s = new Sprite(jungleTexture as Texture);
-    s.x = -(OVERDRAW_X / 2);
-    s.y = y;
-    s.width = tileW;
-    s.height = tileH;
-    s.alpha = 1;
-    backgroundLayer.addChild(s);
-  }
+  tileLayer(jungleTexture, jungleLayer, h=>jungleTileHeight=h);
+  tileLayer(carnivalTexture, carnivalLayer, h=>carnivalTileHeight=h);
+  updateZoneCrossfade();
 }
 
 function drawConnector(g: Graphics, fromLevel: number, toLevel: number) {
@@ -440,11 +467,7 @@ function createLevels(){
     const container = new Container(); container.x=pos.x; container.y=pos.y; container.eventMode='static'; container.cursor='pointer';
     const g = new Graphics();
     const catAssign = getCategoryAssignment(levelNumber);
-    if(catAssign){ // placeholder: reuse circle until category shapes added
-      drawCircleForState(g, computeState(levelNumber));
-    } else {
-      drawCircleForState(g, computeState(levelNumber));
-    }
+    if(catAssign) drawCategoryShape(g, catAssign); else drawCircleForState(g, computeState(levelNumber));
     const label = new Text({ text:String(levelNumber), style: levelLabelStyle }); label.anchor.set(0.5); label.y=2;
     container.addChild(g,label);
     container.hitArea = new Circle(0,0,TILE_RADIUS);
@@ -479,6 +502,24 @@ function positionPlayer(level: number, instant = false, duration = 600) {
   const targetY = pos.y + 2; // slight vertical alignment with circle center / label
   if (instant) { playerToken.position.set(targetX, targetY); return; }
   tween(playerToken, { x: targetX, y: targetY }, duration, easeInOutCubic);
+}
+
+// ---------------- Zone Crossfade Logic ----------------
+function levelToY(level:number){ return positions[level-1]?.y ?? 0; }
+// Determine a vertical boundary Y using boundary level position; crossfade across a vertical band
+function getZoneBoundaryY(){ return levelToY(ZONE_BOUNDARY_LEVEL); }
+// Size of blend band in pixels (above & below boundary center)
+const ZONE_BLEND_HALF = 400; // tune for smoother / longer transition
+function updateZoneCrossfade(){
+  // Compute midpoint of viewport (world space)
+  const viewportMidYWorld = -world.position.y + viewHeight/2;
+  const boundaryY = getZoneBoundaryY();
+  const dy = viewportMidYWorld - boundaryY; // negative means below boundary (earlier levels)
+  // Map dy into 0..1 fade: when dy <= -ZONE_BLEND_HALF => jungle=1; when dy >= ZONE_BLEND_HALF => carnival=1
+  const t = clamp((dy + ZONE_BLEND_HALF) / (ZONE_BLEND_HALF*2), 0, 1);
+  jungleLayer.alpha = 1 - t;
+  carnivalLayer.alpha = t;
+  currentZoneId = t < 0.5 ? 'Jungle' : 'Carnival';
 }
 
 function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>) {
@@ -549,7 +590,10 @@ function triggerCategoryInteraction(level:number, manual:boolean, depth=0){
   }
   const eff: CategoryId = assign.category==='mystery' && assign.resolvedAs ? assign.resolvedAs : assign.category;
   if(eff==='minigame'){
-    if(!assign.minigame){ assign.minigame = MINIGAMES[Math.floor(Math.random()*MINIGAMES.length)]; saveCategoryAssignments(); }
+    if(!assign.minigame || !MINIGAMES.includes(assign.minigame)){
+      assign.minigame = MINIGAMES[Math.floor(Math.random()*MINIGAMES.length)];
+      saveCategoryAssignments();
+    }
     let mg = getAssignmentForLevel(assign.level);
     if(!mg){ mg = { level: assign.level, game: assign.minigame!, completed: !!assign.completed }; minigameAssignments.push(mg); saveMinigameAssignments(); }
     if(!mg.completed) openMinigameModal(mg); else openInfoModal('Minigame','Already completed.');
@@ -685,6 +729,7 @@ function centerCameraOnLevel(level: number, instant = false) {
     // Keep background vertically synced, but do NOT move horizontally with camera
     backgroundLayer.y = world.position.y; // vertical lock (no parallax)
     backgroundLayer.x = 0; // horizontal decoupling keeps river centered
+    updateZoneCrossfade();
   };
   if (instant) {
     world.position.set(targetX, targetY);
@@ -708,6 +753,7 @@ function applyWorldY(y: number) {
   world.position.y = y;
   // sync background vertical position
   backgroundLayer.y = world.position.y;
+  updateZoneCrossfade();
 }
 
 function enableFreeScroll(rootEl: HTMLElement) {
@@ -965,12 +1011,14 @@ function handleResize() {
   centerCameraOnLevel(prevLevel, true);
   backgroundLayer.y = world.position.y;
   backgroundLayer.x = 0;
+  updateZoneCrossfade();
   updateCurrencyCounters();
 }
 
 // ---------------- Debug Overlay (toggle with '0') ----------------
 let debugShown = false;
 let debugEl: HTMLDivElement | null = null;
+let debugButtonsEl: HTMLDivElement | null = null; // holds clickable debug controls (separate from readonly overlay)
 function initDebugOverlay() {
   window.addEventListener('keydown', (e) => {
     if (e.key === '0') {
@@ -985,10 +1033,46 @@ function initDebugOverlay() {
             color: '#fff', font: '12px/1.3 monospace', zIndex: '9999', maxWidth: '240px', borderRadius: '6px',
             pointerEvents: 'none', whiteSpace: 'pre', backdropFilter: 'blur(3px)' });
         }
+        if(!debugButtonsEl){
+          debugButtonsEl = document.createElement('div');
+          debugButtonsEl.className = 'debug-buttons';
+          document.body.appendChild(debugButtonsEl);
+          Object.assign(debugButtonsEl.style, {
+            position: 'fixed', bottom: '10px', right: '10px', display: 'flex', flexDirection: 'column', gap: '6px',
+            zIndex: '10000', padding: '8px', background: 'rgba(0,0,0,0.65)', border: '1px solid rgba(255,255,255,0.15)',
+            borderRadius: '8px', font: '12px system-ui, sans-serif', boxShadow: '0 2px 6px rgba(0,0,0,0.4)'
+          });
+          const mkBtn = (label:string, game:MinigameId)=>{
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            Object.assign(b.style, {
+              cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+              borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+            });
+            b.addEventListener('mouseenter', ()=>{ b.style.background = '#333'; });
+            b.addEventListener('mouseleave', ()=>{ b.style.background = '#222'; });
+            b.addEventListener('click', ()=>{
+              const assign: MinigameAssignment = { level: -1, game, completed: false };
+              openMinigameModal(assign);
+            });
+            return b;
+          };
+          debugButtonsEl.appendChild(mkBtn('Force Slot', 'slot'));
+          debugButtonsEl.appendChild(mkBtn('Force Spin Wheel', 'spin_wheel'));
+          debugButtonsEl.appendChild(mkBtn('Force Loot Box', 'lootbox'));
+          // Close button for convenience
+          const closeBtn = mkBtn('Close Debug (0)', 'slot');
+          closeBtn.removeEventListener('click', ()=>{}); // remove earlier listener
+          closeBtn.addEventListener('click', ()=>{ window.dispatchEvent(new KeyboardEvent('keydown', { key: '0' })); });
+          Object.assign(closeBtn.style, { background: '#552222' });
+          debugButtonsEl.appendChild(closeBtn);
+        }
         updateDebugOverlay();
       } else if (debugEl) {
         debugEl.remove();
         debugEl = null;
+        if(debugButtonsEl){ debugButtonsEl.remove(); debugButtonsEl = null; }
       }
     }
   });
@@ -1007,6 +1091,7 @@ function updateDebugOverlay() {
   const ahead = Math.min(LEVEL_COUNT, current + 7);
   const visibleRange = `${current}-${ahead}`;
   const mgCount = minigameAssignments.length;
+  const catCount = categoryAssignments.length;
   debugEl.textContent =
     `VIEW: ${viewWidth}x${viewHeight}\n` +
     `TILE_RADIUS: ${TILE_RADIUS.toFixed(1)}\n` +
@@ -1015,8 +1100,9 @@ function updateDebugOverlay() {
     `paddings T:${TOP_VISIBLE_PADDING} B:${BOTTOM_VISIBLE_PADDING}\n` +
     `camera: (${camX}, ${camY})\n` +
     `progress: ${current}/${LEVEL_COUNT} visible:${visibleRange}\n` +
-  `minigames: ${mgCount}\n`+
-  `day: ${dayState.day} rollUsed:${dayState.rollUsed} streak:${streakState.streak}`;
+  `categories: ${catCount} minigames: ${mgCount}\n`+
+  `day: ${dayState.day} rollUsed:${dayState.rollUsed} streak:${streakState.streak}\n`+
+  `zone: ${currentZoneId}`;
 }
 
 // ---------------- Minigame Modals ----------------
@@ -1034,23 +1120,25 @@ function openMinigameModal(assign: MinigameAssignment){
 
 function minigameTitle(id:MinigameId){
   switch(id){
-    case 'stop_bar': return 'Stop The Bar';
-    case 'coin_flip': return 'Heads or Tails';
-    case 'rps': return 'Rock Paper Scissors';
-    case 'memory_flip': return 'Memory Flip';
     case 'slot': return '3x1 Slot';
     case 'spin_wheel': return 'Spin Wheel';
+    case 'lootbox': return 'Loot Box';
+    default: return 'Minigame';
   }
 }
 
 function initMinigameUI(assign:MinigameAssignment, root:HTMLDivElement, resultEl:HTMLDivElement){
+  if(!MINIGAMES.includes(assign.game)){
+    // Attempt self-heal: pick a random available minigame and persist
+    assign.game = MINIGAMES[Math.floor(Math.random()*MINIGAMES.length)];
+    saveMinigameAssignments();
+  }
   switch(assign.game){
-    case 'stop_bar': initStopBar(root, assign, resultEl); break;
-    case 'coin_flip': initCoinFlip(root, assign, resultEl); break;
-    case 'rps': initRPS(root, assign, resultEl); break;
-    case 'memory_flip': initMemoryFlip(root, assign, resultEl); break;
-    case 'slot': initSlot(root, assign, resultEl); break;
-    case 'spin_wheel': initSpinWheel(root, assign, resultEl); break;
+    case 'slot': return initSlot(root, assign, resultEl);
+    case 'spin_wheel': return initSpinWheel(root, assign, resultEl);
+    case 'lootbox': return initLootBox(root, assign, resultEl);
+    default:
+      root.innerHTML = `<p style='text-align:center;'>Minigame unavailable.</p>`;
   }
 }
 
@@ -1071,88 +1159,6 @@ function completeMinigame(assign:MinigameAssignment, success:boolean, resultEl:H
   resultEl.innerHTML = msg;
 }
 
-// ---- Stop Bar ----
-function initStopBar(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
-  root.innerHTML = `<div class='stop-bar' style='position:relative;width:260px;height:34px;border:2px solid #444;border-radius:6px;margin:10px auto;background:#222;'>
-    <div class='green-zone' style='position:absolute;left:40%;width:20%;top:0;bottom:0;background:#2e7d32;opacity:0.5;'></div>
-    <div class='cursor' style='position:absolute;left:0;top:0;bottom:0;width:18px;background:#ff9f43;border-radius:4px;'></div>
-  </div>
-  <button class='primary' data-action='stop'>Stop</button>`;
-  const cursor = root.querySelector('.cursor') as HTMLDivElement; const green = root.querySelector('.green-zone') as HTMLDivElement;
-  let dir = 1; let pos = 0; let anim=true;
-  function frame(){ if(!anim) return; pos += dir*3; if(pos>242){ pos=242; dir=-1;} if(pos<0){pos=0; dir=1;} cursor.style.left=pos+'px'; requestAnimationFrame(frame);} requestAnimationFrame(frame);
-  root.querySelector('[data-action="stop"]')?.addEventListener('click', ()=>{ anim=false; const cRect = cursor.getBoundingClientRect(); const gRect = green.getBoundingClientRect(); const overlap = !(cRect.right < gRect.left || cRect.left > gRect.right); completeMinigame(assign, overlap, resultEl); });
-}
-
-// ---- Coin Flip ----
-function initCoinFlip(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
-  root.innerHTML = `<div class='coin-choices'><button data-choice='H'>Heads</button><button data-choice='T'>Tails</button></div><div class='coin-result' style='margin-top:8px;'></div>`;
-  const res = root.querySelector('.coin-result') as HTMLDivElement;
-  root.querySelectorAll('button[data-choice]').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      if(assign.completed) return;
-      const choice = (btn as HTMLButtonElement).dataset.choice;
-      res.textContent = 'Flipping...';
-      setTimeout(()=>{
-        const flip = Math.random()<0.5?'H':'T';
-        const success = flip===choice;
-        res.textContent = 'Result: '+(flip==='H'?'Heads':'Tails');
-        completeMinigame(assign, success, resultEl);
-      }, 600);
-    });
-  });
-}
-
-// ---- Rock Paper Scissors ----
-function initRPS(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
-  const opts = ['rock','paper','scissors'] as const;
-  root.innerHTML = `<div class='rps-buttons'>${opts.map(o=>`<button data-rps='${o}'>${o}</button>`).join('')}</div><div class='rps-result' style='margin-top:6px;'></div>`;
-  const res = root.querySelector('.rps-result') as HTMLDivElement;
-  root.querySelectorAll('button[data-rps]').forEach(b=> b.addEventListener('click', ()=>{
-    if(assign.completed) return;
-    const player = (b as HTMLButtonElement).dataset.rps!;
-    const ai = opts[Math.floor(Math.random()*3)];
-    let win = (player==='rock'&&ai==='scissors')||(player==='paper'&&ai==='rock')||(player==='scissors'&&ai==='paper');
-    res.textContent = `You: ${player} vs ${ai}`;
-    completeMinigame(assign, win, resultEl);
-  }));
-}
-
-// ---- Memory Flip (3x3 one pair) ----
-function initMemoryFlip(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
-  const positions = Array.from({length:9},(_,i)=>i);
-  const pairSymbol = '★';
-  const pair = positions.sort(()=>Math.random()-0.5).slice(0,2);
-  let revealed: number[] = []; let found=false; let attempts=0; const maxAttempts=6;
-  root.innerHTML = `<div class='mem-grid' style='display:grid;grid-template-columns:repeat(3,54px);gap:6px;'>${positions.map(i=>`<button class='card' data-idx='${i}' style='height:54px;font-size:20px;'>?</button>`).join('')}</div><div class='mem-status'></div>`;
-  const status = root.querySelector('.mem-status') as HTMLDivElement;
-  function update(){ status.textContent = found? 'Pair found!' : `Attempts: ${attempts}/${maxAttempts}`; }
-  update();
-  root.querySelectorAll('.card').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
-      if(assign.completed||found) return;
-      const idx = Number((btn as HTMLButtonElement).dataset.idx);
-      if(revealed.includes(idx)) return;
-      (btn as HTMLButtonElement).textContent = pair.includes(idx)?pairSymbol:'✧';
-      revealed.push(idx);
-      if(revealed.length===2){
-        attempts++;
-        if(pair.every(p=>revealed.includes(p))){ found=true; completeMinigame(assign,true,resultEl); }
-        else {
-          setTimeout(()=>{
-            revealed.forEach(r=>{ const b = root.querySelector(`.card[data-idx='${r}']`) as HTMLButtonElement; if(b) b.textContent='?'; });
-            revealed=[]; update();
-            if(attempts>=maxAttempts && !found) completeMinigame(assign,false,resultEl);
-          }, 600);
-        }
-      } else if(revealed.length>2){
-        // reset logic safety
-        revealed=[];
-      }
-      update();
-    });
-  });
-}
 
 // ---- Slot (3x1) ----
 function initSlot(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
@@ -1182,25 +1188,207 @@ function initSlot(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLD
 
 // ---- Spin Wheel ----
 function initSpinWheel(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
-  // Show simplified wheel as a list; highlight chosen after spin
-  root.innerHTML = `<div class='wheel' style='max-height:140px;overflow:auto;border:1px solid #444;margin-bottom:8px;'>${REWARDS.map((r,i)=>`<div class='wheel-slot' data-i='${i}' style='padding:4px;'>${r.label}</div>`).join('')}</div><button class='primary' data-action='spinwheel'>Spin</button>`;
-  root.querySelector('[data-action="spinwheel"]')?.addEventListener('click', ()=>{
-    if(assign.completed) return;
-    const targetIdx = Math.floor(Math.random()*REWARDS.length);
-    const slots = root.querySelectorAll('.wheel-slot');
-    let idx=0; let cycles=0;
-    const spinTimer = setInterval(()=>{
-      slots.forEach(s=> (s as HTMLDivElement).style.background='');
-      (slots[idx] as HTMLDivElement).style.background='#ff9f43';
-      idx = (idx+1)%slots.length; cycles++;
-      if(cycles> REWARDS.length*4 && idx===targetIdx){
-        clearInterval(spinTimer);
-        slots.forEach(s=> (s as HTMLDivElement).style.background='');
-        (slots[targetIdx] as HTMLDivElement).style.background='#4caf50';
-        const reward = REWARDS[targetIdx];
-        if(reward.kind==='nothing') completeMinigame(assign,false,resultEl); else { applyReward(reward); (resultEl.innerHTML = `<p><strong>Reward:</strong> ${reward.label}</p>`); assign.completed=true; saveMinigameAssignments(); refreshStates(); }
-      }
-    }, 80);
+  // Graphical circular wheel
+  const sliceCount = REWARDS.length;
+  const size = 260; // pixel diameter
+  root.innerHTML = `<div style='position:relative;width:${size}px;height:${size}px;margin:0 auto 12px;'>
+    <canvas class='spin-wheel-canvas' width='${size}' height='${size}' style='width:${size}px;height:${size}px;display:block;'></canvas>
+    <div class='wheel-pointer' style='position:absolute;left:50%;bottom:-10px;transform:translateX(-50%);width:0;height:0;border-left:16px solid transparent;border-right:16px solid transparent;border-bottom:30px solid #ff9f43;filter:drop-shadow(0 2px 4px rgba(0,0,0,.6));'></div>
+  </div>
+  <button class='primary' data-action='spinwheel'>Spin</button>`;
+  const canvas = root.querySelector('.spin-wheel-canvas') as HTMLCanvasElement;
+  const ctx = canvas.getContext('2d');
+  if(!ctx) return;
+  const cx = ctx as CanvasRenderingContext2D; // non-null assertion helper
+  const center = size/2;
+  const radius = size/2 - 4;
+  // Pre-pick target slice for fairness and compute final rotation to land that slice at pointer (pointer at top / angle 0)
+  const targetIndex = Math.floor(Math.random()*sliceCount);
+  // Draw static wheel (we'll rotate canvas using CSS transform)
+  const colors = ['#243240','#2f4256','#364d63','#2a3947'];
+  function drawWheel(rotation: number){
+    cx.clearRect(0,0,size,size);
+    cx.save();
+    cx.translate(center, center);
+    // Apply 180deg base rotation so visual slice mapping inverts
+  // Bottom pointer: natural 0 angle points to the right; we want slice centers to pass bottom (angle = Math.PI/2)
+  cx.rotate(rotation);
+    const arc = (Math.PI*2)/sliceCount;
+    for(let i=0;i<sliceCount;i++){
+  cx.beginPath();
+  cx.moveTo(0,0);
+  cx.fillStyle = colors[i%colors.length];
+  cx.arc(0,0,radius, i*arc, (i+1)*arc);
+  cx.closePath();
+  cx.fill();
+  cx.save();
+  cx.rotate(i*arc + arc/2);
+  cx.translate(radius*0.62,0);
+  cx.rotate(Math.PI/2);
+  cx.fillStyle='#fff';
+  cx.font='12px system-ui, sans-serif';
+  cx.textAlign='center';
+  cx.textBaseline='middle';
+    const reward = REWARDS[i];
+    const short = reward.kind==='tokens' ? `${reward.amount}T` :
+          reward.kind==='freePlays' ? `${reward.amount}FP` :
+          reward.kind==='cash' ? `${(reward.amount||0)/100}£` :
+          reward.kind==='bonus' ? `${(reward.amount||0)/100}B` : '—';
+    const icon = reward.kind==='tokens' ? '🪙' :
+           reward.kind==='freePlays' ? '▶️' :
+           reward.kind==='cash' ? '💷' :
+           reward.kind==='bonus' ? '🎟️' : 'Ø';
+    wrapText(cx, icon + '\n' + short,0,0,70,12);
+  cx.restore();
+    }
+    cx.restore();
+  }
+  function wrapText(context:CanvasRenderingContext2D, text:string, x:number, y:number, maxWidth:number, lineHeight:number){
+    const words = text.split(' ');
+    let line='';
+    const lines:string[]=[];
+    for(const w of words){
+      const test = line ? line+' '+w : w;
+      if(context.measureText(test).width > maxWidth){ lines.push(line); line=w; } else line=test;
+    }
+    if(line) lines.push(line);
+    const offsetY = -((lines.length-1)*lineHeight)/2;
+    lines.forEach((ln,i)=> context.fillText(ln,x,y+offsetY + i*lineHeight));
+  }
+  drawWheel(0);
+  const spinBtn = root.querySelector('[data-action="spinwheel"]') as HTMLButtonElement;
+  let spinning=false;
+  spinBtn.addEventListener('click',()=>{
+    if(spinning||assign.completed) return; spinning=true; spinBtn.disabled=true; spinBtn.textContent='Spinning...';
+    // physics-ish spin: base rotations + random extra, then land precisely so targetIndex is selected
+    const arc = (Math.PI*2)/sliceCount;
+    const baseRotations = 6; // full turns
+  // Pointer now at top but wheel pre-rotated 180deg; adjust final angle accordingly
+  // We want target slice center to end at angle Math.PI/2 (bottom). Current rotation adds rotation value positively.
+  // Slice center angle (without rotation) = targetIndex*arc + arc/2. We solve rotation so: (sliceAngle + rotation) mod 2PI = Math.PI/2
+  // => rotation = Math.PI/2 - sliceAngle
+  const sliceAngle = targetIndex*arc + arc/2;
+  const finalAngle = (Math.PI/2) - sliceAngle;
+    const totalRotation = baseRotations*Math.PI*2 + finalAngle + (Math.random()*arc - arc/2)*0.15; // slight jitter without changing target index
+    const duration = 3800;
+    const start = performance.now();
+    function easeOutQuart(t:number){ return 1 - Math.pow(1 - t, 4); }
+    function animate(now:number){
+      const t = Math.min(1, (now-start)/duration);
+      const eased = easeOutQuart(t);
+      const current = totalRotation * eased;
+      drawWheel(current);
+      if(t<1) requestAnimationFrame(animate); else finish();
+    }
+    requestAnimationFrame(animate);
+    function finish(){
+      const reward = REWARDS[targetIndex];
+      // Award (treat 'nothing' as neutral outcome, still completes)
+      if(reward.kind!=='nothing') applyReward(reward);
+      assign.completed = true; saveMinigameAssignments();
+      const catAssign = getCategoryAssignment(assign.level); if(catAssign && !catAssign.completed){ catAssign.completed=true; saveCategoryAssignments(); }
+      refreshStates();
+      resultEl.innerHTML = reward.kind==='nothing'
+        ? `<p><strong>No reward</strong> this spin.</p>`
+        : `<p><strong>Reward:</strong> ${reward.label}</p>`;
+    }
+  });
+}
+
+// ---- Loot Box ----
+function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HTMLDivElement){
+  // Rarity & weight system local to loot box (weights sum arbitrary; normalized internally)
+  interface WeightedReward { reward: Reward; weight: number; rarity: 'common'|'uncommon'|'rare'|'epic'|'mythic'; }
+  const rarityStyles: Record<string,{color:string;bg:string}> = {
+    common:{color:'#ddd', bg:'#2a2a2a'},
+    uncommon:{color:'#b1f29d', bg:'#244a28'},
+    rare:{color:'#82c7ff', bg:'#14344d'},
+    epic:{color:'#d5a6ff', bg:'#41245b'},
+    mythic:{color:'#ffdf7f', bg:'#5a430f'}
+  };
+  // Map existing rewards to rarities (tune as desired)
+  const weighted: WeightedReward[] = REWARDS.map(r=>{
+    let rarity: WeightedReward['rarity'] = 'common';
+    let weight = 30;
+    if(r.kind==='nothing'){ rarity='common'; weight=40; }
+    else if(r.kind==='tokens' && (r.amount||0) >=50){ rarity='uncommon'; weight=18; }
+    else if(r.kind==='cash' && (r.amount||0) >=100){ rarity='rare'; weight=10; }
+    else if(r.kind==='bonus' && (r.amount||0) >=500){ rarity='epic'; weight=4; }
+    else if(r.kind==='tokens' && (r.amount||0) >=100){ rarity='rare'; weight=8; }
+    else if(r.kind==='freePlays' && (r.amount||0) >=5){ rarity='rare'; weight=7; }
+    else if(r.kind==='bonus' && (r.amount||0) >=100){ rarity='uncommon'; weight=16; }
+    return { reward:r, weight, rarity };
+  });
+  function pickWeighted(): WeightedReward {
+    const total = weighted.reduce((s,w)=>s+w.weight,0);
+    let roll = Math.random()*total;
+    for(const w of weighted){ if(roll < w.weight) return w; roll-=w.weight; }
+    return weighted[0];
+  }
+  // Pre-determine final reward for fairness
+  const final = pickWeighted();
+  // Build reel items (populate with random rewards, ensure final appears near end so decel lands there)
+  const ITEM_COUNT = 48;
+  const FINAL_INDEX = 40; // stop with item centered
+  const reelRewards: WeightedReward[] = [];
+  for(let i=0;i<ITEM_COUNT;i++){ if(i===FINAL_INDEX) reelRewards.push(final); else reelRewards.push(pickWeighted()); }
+  root.innerHTML = `<div style='display:flex;flex-direction:column;align-items:center;gap:14px;width:100%;'>
+    <div class='lootbox-reel-wrapper' style='position:relative;width:320px;height:86px;overflow:hidden;border:3px solid #555;border-radius:14px;background:#111;'>
+      <div class='indicator' style='position:absolute;left:50%;top:0;bottom:0;width:2px;background:#ff9f43;box-shadow:0 0 6px #ff9f43;transform:translateX(-50%);pointer-events:none;'></div>
+      <div class='lootbox-track' style='display:flex;align-items:center;gap:8px;will-change:transform;padding:8px;'></div>
+    </div>
+  <button class='primary' data-action='open'>Start</button>
+  </div>`;
+  const track = root.querySelector('.lootbox-track') as HTMLDivElement;
+  reelRewards.forEach(rw=>{
+    const st = rarityStyles[rw.rarity];
+    const el = document.createElement('div');
+    el.className='lb-item';
+    el.style.cssText = `flex:0 0 96px;height:60px;border:2px solid ${st.color};border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;font-weight:600;letter-spacing:.5px;text-align:center;color:${st.color};background:${st.bg};padding:4px;box-shadow:0 0 4px rgba(0,0,0,.6);`;
+    el.innerHTML = `<span style='font-size:12px;'>${rw.reward.label.replace(/\s+/g,'<br>')}</span>`;
+    track.appendChild(el);
+  });
+  const btn = root.querySelector('[data-action="open"]') as HTMLButtonElement;
+  let started=false;
+  btn.addEventListener('click',()=>{
+    if(started||assign.completed) return; started=true; btn.disabled=true; btn.textContent='Opening...';
+    const itemWidth = 96+8; // width + gap
+    const targetOffset = (FINAL_INDEX * itemWidth) - (320/2 - itemWidth/2);
+    const duration = 4500;
+    const start = performance.now();
+    function easeOutCubic(t:number){ return 1 - Math.pow(1-t,3); }
+    function frame(now:number){
+      const t = Math.min(1, (now-start)/duration);
+      const eased = easeOutCubic(t);
+      const current = targetOffset * eased;
+      track.style.transform = `translateX(${-current}px)`;
+      if(t<1) requestAnimationFrame(frame); else finish();
+    }
+    requestAnimationFrame(frame);
+    function finish(){
+      const wrapper = root.querySelector('.lootbox-reel-wrapper') as HTMLDivElement;
+      const indicatorX = wrapper.getBoundingClientRect().left + wrapper.clientWidth/2;
+      let bestIndex = 0; let bestDist = Infinity; let bestEl:HTMLDivElement|null=null;
+      Array.from(track.children).forEach((c,i)=>{
+        const rect = (c as HTMLDivElement).getBoundingClientRect();
+        const cx = rect.left + rect.width/2;
+        const d = Math.abs(cx - indicatorX);
+        if(d < bestDist){ bestDist=d; bestIndex=i; bestEl=c as HTMLDivElement; }
+      });
+      const finalEl = bestEl || (track.children[FINAL_INDEX] as HTMLDivElement);
+      finalEl.style.outline='3px solid #fff';
+      finalEl.animate([
+        { transform:'scale(1)' },{ transform:'scale(1.15)' },{ transform:'scale(1)' }
+      ],{ duration:600, easing:'ease' });
+      const rewardObj = reelRewards[bestIndex].reward;
+      if(rewardObj.kind!=='nothing') applyReward(rewardObj);
+      assign.completed = true; saveMinigameAssignments();
+      const catAssign = getCategoryAssignment(assign.level); if(catAssign && !catAssign.completed){ catAssign.completed=true; saveCategoryAssignments(); }
+      refreshStates();
+      resultEl.innerHTML = rewardObj.kind==='nothing'
+        ? `<p><strong>No reward</strong> this time.</p>`
+        : `<p><strong>Reward:</strong> ${rewardObj.label}</p>`;
+    }
   });
 }
 
@@ -1356,32 +1544,11 @@ function openBonusRoundModal(assign:CategoryAssignment){
 }
 
 function openRevealModal(assign:CategoryAssignment){
+  // Simplified: direct reveal (pick-1-of-3 removed)
   closeModal();
-  const reward = randomInstantPrize();
-  const winningIndex = randInt(0,2);
-  const backdrop = document.createElement('div'); backdrop.className='modal-backdrop';
-  const modal = document.createElement('div'); modal.className='modal'; modal.setAttribute('role','dialog');
-  modal.innerHTML = `<button class='close-btn' aria-label='Close'>×</button><h2>Reveal</h2><p>Pick a chest.</p>
-    <div class='chest-row' style='display:flex;gap:24px;justify-content:center;margin:16px 0;'>
-      ${[0,1,2].map(i=>`<button class='chest-btn' data-i='${i}' style='width:82px;height:82px;border:2px solid #555;border-radius:10px;background:#222;font-size:38px;cursor:pointer;'>🗃️</button>`).join('')}
-    </div><div class='result'></div>`;
-  const resultEl = modal.querySelector('.result') as HTMLDivElement;
-  function finish(win:boolean){
-    if(win){ reward.apply(); resultEl.innerHTML = `<p>You found <strong>${reward.label}</strong>!</p>`; }
-    else resultEl.innerHTML = `<p>Empty! Prize was <strong>${reward.label}</strong></p>`;
-    assign.completed=true; saveCategoryAssignments(); refreshStates();
-    modal.querySelectorAll('.chest-btn').forEach(b=> (b as HTMLButtonElement).disabled = true);
-    if(!modal.querySelector('.modal-footer')){
-      const footer = document.createElement('div'); footer.className='modal-footer'; footer.innerHTML = `<button class='primary' data-action='close'>Close</button>`; modal.appendChild(footer); footer.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
-    }
-  }
-  modal.querySelectorAll('.chest-btn').forEach(btn=> btn.addEventListener('click',()=>{
-    if(assign.completed) return;
-    const idx = Number((btn as HTMLButtonElement).dataset.i); finish(idx===winningIndex);
-  }));
-  backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
-  modal.querySelector('.close-btn')?.addEventListener('click', closeModal);
-  backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  const reward = randomInstantPrize(); reward.apply();
+  assign.completed = true; saveCategoryAssignments(); refreshStates();
+  openInfoModal('Reveal', `<p>You uncovered <strong>${reward.label}</strong>.</p>`);
 }
 
 function openMoveChainModal(assign:CategoryAssignment, forward:boolean){

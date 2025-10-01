@@ -999,6 +999,8 @@ function renderControls() {
   }
   controls.querySelector('[data-action="reset"]')?.addEventListener('click', () => {
     if (confirm('Reset your progress?')) {
+      // Close any open modal / overlay first
+      closeModal();
       progress.current = 1;
       saveProgress(progress);
       // Clear completion / resolution on all category & minigame assignments so no tiles stay green
@@ -1014,9 +1016,33 @@ function renderControls() {
       dayState.day = 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
       // Reset streak state
       streakState.streak = 0; saveStreakState(); updateStreakUI();
+      // Remove any inline next day button and restore dice visibility
+      document.querySelectorAll('.inline-next-day-btn').forEach(el=> el.remove());
+      const diceBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null;
+      if(diceBtn){
+        diceBtn.style.display='';
+        diceBtn.disabled = false;
+        diceBtn.classList.remove('daily-used');
+        diceBtn.classList.add('can-roll');
+      }
+      // Allow jackpot to be earned again on fresh tutorial day
+      if(typeof prizeStarJackpotPlayedToday !== 'undefined') prizeStarJackpotPlayedToday = false;
+      // Reset any minigame/day completion flags so evaluation doesn't instantly show next-day
+      dayMinigameCompleted = false;
+      // Restore tutorial-sized board (hide extended 31..100) by shrinking LEVEL_COUNT and regenerating structure
+      LEVEL_COUNT = 30; // revert to original tutorial board size
+      // Regenerate assignments for the 30-tile tutorial board
+      generateMinigameAssignments();
+      generateCategoryAssignments();
       refreshStates();
       positionPlayer(progress.current, true);
       centerCameraOnLevel(progress.current, true);
+      // Rebuild trail visuals to physically remove tiles >30 if they were present
+      trailLayer.removeChildren(); levelLayer.removeChildren(); connectors.splice(0, connectors.length); levelNodes.splice(0, levelNodes.length);
+      positions = generateVerticalPositions(LEVEL_COUNT);
+      height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
+      app.renderer.resize(viewWidth, viewHeight);
+      buildTrail(); createLevels(); refreshStates(); positionPlayer(progress.current, true);
       // Fire start_day popups shortly after reset (allow camera recenter)
       setTimeout(()=> maybeApplyTutorialPopups('start_day'), 400);
     }
@@ -1086,6 +1112,7 @@ function openModal(level: number) {
   modal.querySelector('[data-action="cancel"]')?.addEventListener('click', closeModal);
   modal.querySelector('[data-action="complete"]')?.addEventListener('click', () => { completeLevel(level); closeModal(); });
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
   setTimeout(() => (modal.querySelector('[data-action="complete"]') as HTMLButtonElement)?.focus(), 30);
 }
 let pendingPostMinigamePhase = false;
@@ -1096,6 +1123,7 @@ let pendingMetaTrail = false; // set when we should animate key/star travel afte
 let deferredCategoryAction: (()=>void) | null = null;
 function closeModal() { 
   document.querySelector('.modal-backdrop')?.remove();
+  document.body.classList.remove('modal-open');
   let fired=false;
   if(pendingPostInstantWinPhase){
     pendingPostInstantWinPhase=false; fired=true;
@@ -1385,6 +1413,7 @@ function openMinigameModal(assign: MinigameAssignment){
   backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
   modal.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
   initMinigameUI(assign, modal.querySelector('.minigame') as HTMLDivElement, modal.querySelector('.result') as HTMLDivElement);
   // Show stacked tutorial card after render
   setTimeout(()=> showStackedPreMinigameMessages(assign, modal), 140);
@@ -1876,6 +1905,7 @@ function openLegendModal(){
   backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
   modal.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
   setTimeout(()=>{
     modal.querySelectorAll('canvas[data-shape]').forEach(cnv=>{
       const ctx=(cnv as HTMLCanvasElement).getContext('2d'); if(!ctx) return; const r=20; const type=(cnv as HTMLCanvasElement).dataset.shape as CategoryId; ctx.lineWidth=3; ctx.strokeStyle='#182028'; ctx.fillStyle='#5a6470'; ctx.beginPath();
@@ -1932,6 +1962,7 @@ function openInfoModal(title:string, bodyHtml:string, onClose?:()=>void){
   backdrop.addEventListener('click', e=>{ /* no outside close */ });
   modal.querySelector('[data-action="close"]')?.addEventListener('click', ()=>{ closeModal(); onClose?.(); });
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
 }
 
 function openInstantTokensModal(assign:CategoryAssignment){
@@ -2257,6 +2288,7 @@ function openChainedInfoModal(pages:string[]){
   // Disable outside click dismissal
   backdrop.addEventListener('click', ()=>{});
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
   const copyRoot = modal.querySelector('.tutor-copy') as HTMLDivElement | null;
   const nextBtn = modal.querySelector('.next-btn') as HTMLButtonElement | null;
   const prevBtn = modal.querySelector('.prev-btn') as HTMLButtonElement | null;
@@ -2398,6 +2430,7 @@ function showPrizeStarJackpotOverlay(){
     grid.appendChild(btn);
   }
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
+  document.body.classList.add('modal-open');
   closeBtn.addEventListener('click',()=>{
     if(closeBtn.disabled) return;
     // Reset prize stars back to zero after awarding

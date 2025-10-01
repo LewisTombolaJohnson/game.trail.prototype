@@ -85,6 +85,30 @@ body { width:100%; min-height:100dvh; }
   .token-counter .token-icon { width:20px; height:20px; }
 }
 
+/* Compact reset button (top-left) */
+.reset-fab {
+  position:fixed;
+  left:calc(10px + env(safe-area-inset-left));
+  top:calc(10px + env(safe-area-inset-top));
+  z-index:120; /* above controls */
+  background:#402c2c;
+  color:#fff;
+  border:1px solid #6a3d3d;
+  padding:.45rem .7rem;
+  font-size:.75rem;
+  font-weight:600;
+  letter-spacing:.5px;
+  border-radius:10px;
+  cursor:pointer;
+  box-shadow:0 4px 10px -4px rgba(0,0,0,0.55);
+  transition:background .25s, transform .25s;
+}
+.reset-fab:hover { background:#5a2e2e; transform:translateY(-2px); }
+.reset-fab:active { transform:translateY(0); }
+@media (min-width: 900px){
+  .reset-fab { font-size:.7rem; }
+}
+
 /* Modal */
 .modal-backdrop {
   position: fixed;

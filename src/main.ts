@@ -1139,8 +1139,21 @@ function performFullReset(){
   height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
   app.renderer.resize(viewWidth, viewHeight);
   buildTrail(); createLevels(); refreshStates(); positionPlayer(progress.current, true);
-  setTimeout(()=> maybeApplyTutorialPopups('start_day'), 400);
+  // Clear tutorial state so Day 1 tutorial popups can replay
+  resetTutorialState();
+  // Slight delay to allow UI elements to finish rebuilding before showing tutorial
+  setTimeout(()=> maybeApplyTutorialPopups('start_day'), 450);
   updateResetButton();
+}
+
+// Reset tutorial tracking so a fresh run shows Day 1 start_day popup again
+function resetTutorialState(){
+  try {
+    tutorialPopups.splice(0, tutorialPopups.length); // clear any scheduled leftovers
+    shownPlanPopups.clear();
+    forceReplayPhases.clear();
+    pendingForcedMinigame = null;
+  } catch(e){ /* non-fatal */ }
 }
 
 function ensureResetFab(){

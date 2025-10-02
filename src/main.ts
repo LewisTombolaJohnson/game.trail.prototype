@@ -1,16 +1,20 @@
 import { Application, Container, Graphics, Text, TextStyle, Circle, Sprite, Texture, Assets } from 'pixi.js';
 import { isTutorialActive, getTutorialPlanForDay, TutorialDayPlan } from './tutorialPlan';
-import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
-import carnivalBackgroundUrl from '../assets/carnival/carnival_background.png';
-import tokenIconUrl from '../assets/general/token.svg';
-import carnivalCharacterUrl from '../assets/carnival/carnival_character.png';
-// NOTE: These image assets live in Vite's public ("assets") directory.
-// Use BASE_URL prefix so they work both locally (root '/') and on GitHub Pages ('/game.trail.prototype/').
+// NOTE: Assets live in Vite publicDir (`assets`). BASE_URL handles GitHub Pages subpath.
 const base = (import.meta as any).env?.BASE_URL || '/';
+// Background & UI asset URLs (referencing publicDir via BASE_URL)
+const jungleBackgroundUrl = `${base}jungle/jungle_background.png`;
+const carnivalBackgroundUrl = `${base}carnival/carnival_background.png`;
+const tokenIconUrl = `${base}general/token.svg`;
+const carnivalCharacterUrl = `${base}carnival/carnival_character.png`;
 const bonusMoneyIconUrl = `${base}general/BM.png`;
 const freePlaysIconUrl = `${base}general/FP.png`;
 const streakKeyIconUrl = `${base}general/key.png`;
 const prizeStarIconUrl = `${base}general/star.png`;
+// Extended zone backgrounds
+const pirateBackgroundUrl = `${base}pirates/pirate_background.png`;
+const darkUniverseBackgroundUrl = `${base}dark_universe/horror_background.png`;
+const tomorrowlandBackgroundUrl = `${base}tomorrowland/scifi_background.png`;
 
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards
@@ -546,16 +550,30 @@ function buildTrail() {
 // --- Jungle background tiling ---
 let jungleTexture: Texture | null = null;
 let carnivalTexture: Texture | null = null;
+let pirateTexture: Texture | null = null;
+let darkUniverseTexture: Texture | null = null;
+let tomorrowlandTexture: Texture | null = null;
 let jungleTileHeight = 0;
 let carnivalTileHeight = 0;
+let pirateTileHeight = 0;
+let darkUniverseTileHeight = 0;
+let tomorrowlandTileHeight = 0;
 
 async function buildBackground() {
+  // Clear existing sprites so we can rebuild on resize / world expansion
   jungleLayer.removeChildren();
   carnivalLayer.removeChildren();
+  pirateLayer.removeChildren();
+  darkLayer.removeChildren();
+  tomorrowlandLayer.removeChildren();
+  // Lazy load textures (first call only)
   if(!jungleTexture){ try { jungleTexture = await Assets.load(jungleBackgroundUrl);} catch(e){ console.warn('Failed to load jungle', e); } }
   if(!carnivalTexture){ try { carnivalTexture = await Assets.load(carnivalBackgroundUrl);} catch(e){ console.warn('Failed to load carnival', e); } }
-  const OVERDRAW_X = 100;
-  const HEIGHT_MULT = 1.28;
+  if(!pirateTexture){ try { pirateTexture = await Assets.load(pirateBackgroundUrl);} catch(e){ console.warn('Failed to load pirate', e); } }
+  if(!darkUniverseTexture){ try { darkUniverseTexture = await Assets.load(darkUniverseBackgroundUrl);} catch(e){ console.warn('Failed to load dark universe', e); } }
+  if(!tomorrowlandTexture){ try { tomorrowlandTexture = await Assets.load(tomorrowlandBackgroundUrl);} catch(e){ console.warn('Failed to load tomorrowland', e); } }
+  const OVERDRAW_X = 100; // slight horizontal overdraw to hide camera edges
+  const HEIGHT_MULT = 1.28; // vertical stretch to reduce visible seams when camera scrolls
   const tileW = viewWidth + OVERDRAW_X;
   function tileLayer(tex:Texture|null, layer:Container, storeHeight:(h:number)=>void){
     if(!tex) return;
@@ -563,7 +581,7 @@ async function buildBackground() {
     const tileH = Math.round(tex.height * scale * HEIGHT_MULT);
     if(tileH<=0) return;
     storeHeight(tileH);
-    const totalH = height + viewHeight + tileH;
+    const totalH = height + viewHeight + tileH; // cover full scroll range plus one tile for overdraw
     for(let y=0;y<totalH;y+=tileH){
       const s = new Sprite(tex);
       s.x = -(OVERDRAW_X/2);
@@ -576,6 +594,9 @@ async function buildBackground() {
   }
   tileLayer(jungleTexture, jungleLayer, h=>jungleTileHeight=h);
   tileLayer(carnivalTexture, carnivalLayer, h=>carnivalTileHeight=h);
+  tileLayer(pirateTexture, pirateLayer, h=>pirateTileHeight=h);
+  tileLayer(darkUniverseTexture, darkLayer, h=>darkUniverseTileHeight=h);
+  tileLayer(tomorrowlandTexture, tomorrowlandLayer, h=>tomorrowlandTileHeight=h);
   updateZoneCrossfade();
 }
 
@@ -655,37 +676,106 @@ function positionPlayer(level: number, instant = false, duration = 600) {
 
 // ---------------- Multi-Zone Crossfade Logic ----------------
 function levelToY(level:number){ return positions[level-1]?.y ?? 0; }
+// Approximate the level at a given world Y by nearest node (O(n)=300 max, acceptable).
+function yToApproxLevel(y:number): number {
+  let closest = 1; let best = Infinity;
+  for(let i=0;i<positions.length;i++){
+    const d = Math.abs(positions[i].y - y);
+    if(d < best){ best = d; closest = i+1; }
+  }
+  return closest;
+}
 const ZONE_BLEND_HALF = 400;
 function updateZoneCrossfade(){
-  // Camera midpoint world Y drives blending for smoother visual transitions independent of discrete level snaps.
-  const viewportMidYWorld = -world.position.y + viewHeight/2;
-  const zoneAnchors = ZONES.map(z=> ({ id:z.id, y: levelToY(z.startLevel) })).sort((a,b)=> a.y - b.y);
-  // Identify lower & next anchor based on camera position
-  let lower = zoneAnchors[0];
-  let upper: typeof lower | null = null;
-  for(const z of zoneAnchors){ if(viewportMidYWorld >= z.y) lower = z; else { upper = z; break; } }
-  // Reset all alphas first
+  // Determine if we're still in the tutorial phase (board size 30 & day <= 8).
+  const inTutorial = LEVEL_COUNT <= 30 || isTutorialActive(dayState.day);
+  // Hybrid model:
+  // - Use camera midpoint as the "preview" position so free scrolling still shows upcoming zone blending.
+  // - Gate actual blend progress so it won't advance past a threshold until the current tile gets close to screen center.
+  const camMidWorldY = -world.position.y + viewHeight/2;
+  const currentPos = positions[progress.current - 1];
+  const playerWorldY = currentPos ? currentPos.y : camMidWorldY;
+  // Distance (in pixels) within which the player's tile must approach center before full blending is allowed.
+  const GATE_RADIUS = 180; // tune: larger => earlier full blending, smaller => waits longer
+  const distFromCenter = Math.abs(playerWorldY - camMidWorldY);
+  const gatingFactor = clamp(1 - distFromCenter / GATE_RADIUS, 0, 1); // 0 far away, 1 at/near center
+  // We'll compute raw blend based on camMidWorldY (preview), then limit its magnitude by gatingFactor so it only completes near center.
+  const viewportMidYWorld = camMidWorldY;
+  // Reset alphas every call
   jungleLayer.alpha = carnivalLayer.alpha = pirateLayer.alpha = darkLayer.alpha = tomorrowlandLayer.alpha = 0;
   function setAlpha(id:ZoneId,a:number){ if(id==='Jungle') jungleLayer.alpha=a; else if(id==='Carnival') carnivalLayer.alpha=a; else if(id==='Pirate') pirateLayer.alpha=a; else if(id==='DarkUniverse') darkLayer.alpha=a; else if(id==='Tomorrowland') tomorrowlandLayer.alpha=a; }
-  if(!upper){
-    // Past last defined anchor => show final zone fully
-    setAlpha(lower.id as ZoneId, 1);
-    currentZoneId = lower.id as ZoneId;
+
+  if(inTutorial){
+    // Tutorial requirement: START in Carnival (levels 1-14 fully Carnival), then fade to Jungle only at tile 15.
+    // We treat Carnival as the initial zone (virtual start at level 1) and Jungle anchor at level 15.
+    const jungleAnchorY = levelToY(30);
+    const carnivalStartY = levelToY(1);
+    const halfSpan = 260; // how soft the fade is around level 15
+    const centerY = (carnivalStartY + jungleAnchorY) / 2; // mid band center between start and jungle anchor
+    const dy = viewportMidYWorld - centerY;
+    const t = clamp((dy + halfSpan)/(halfSpan*2), 0, 1); // 0 -> Carnival, 1 -> Jungle
+    // Before we reach near level 15 the midY will be closer to carnivalStartY => t near 0
+    // Correct orientation: t=0 => pure Carnival, t=1 => pure Jungle.
+    setAlpha('Carnival', 1 - t);
+    setAlpha('Jungle', t);
+    currentZoneId = t < 0.5 ? 'Carnival' : 'Jungle';
     return;
   }
-  // Blend band centered midway between the two zone anchor start positions
-  const centerY = (lower.y + upper.y)/2;
-  const halfSpan = Math.max(300, (upper.y - lower.y)/2); // ensures perceptible transition even if anchors close
-  const dy = viewportMidYWorld - centerY;
-  const t = clamp((dy + halfSpan)/(halfSpan*2), 0, 1); // 0 near lower, 1 near upper
-  setAlpha(lower.id as ZoneId, 1 - t);
-  setAlpha(upper.id as ZoneId, t);
-  currentZoneId = (t < 0.5 ? lower.id : upper.id) as ZoneId;
-  // Tutorial override: during tutorial days force Carnival look regardless
-  if(isTutorialActive(dayState.day)){
-    jungleLayer.alpha = pirateLayer.alpha = darkLayer.alpha = tomorrowlandLayer.alpha = 0;
-    carnivalLayer.alpha = 1;
-    currentZoneId = 'Carnival';
+
+  // Post-tutorial: Start at Jungle (levels 1-99), then every 100 levels switch to next theme:
+  // Jungle (1-99) -> Pirate (100-199) -> Dark Universe (200-299) -> Tomorrowland (300+) ; Carnival hidden.
+  // Derive an approximate level from scroll position then choose zone anchors by startLevel thresholds.
+  const approxLevel = yToApproxLevel(viewportMidYWorld);
+  const zoneSequence: ZoneDef[] = [
+    { id:'Jungle', startLevel:1 },
+    { id:'Pirate', startLevel:100 },
+    { id:'DarkUniverse', startLevel:200 },
+    { id:'Tomorrowland', startLevel:300 }
+  ];
+  let lowerZone = zoneSequence[0];
+  let upperZone: ZoneDef | null = null;
+  for(let i=0;i<zoneSequence.length;i++){
+    const z = zoneSequence[i];
+    if(approxLevel >= z.startLevel) lowerZone = z; else { upperZone = z; break; }
+  }
+  if(!upperZone){
+    setAlpha(lowerZone.id, 1); currentZoneId = lowerZone.id; return;
+  }
+  const yLower = levelToY(lowerZone.startLevel);
+  const yUpper = levelToY(upperZone.startLevel);
+  // Guard against missing anchors (e.g., user hasn't generated that far yet) -> show lower
+  if(!yLower || !yUpper || yLower === yUpper){ setAlpha(lowerZone.id,1); currentZoneId = lowerZone.id; return; }
+  // yLower > yUpper (lower zone is further down). We want a HARD HOLD on lower zone until we're within ~1 screen height
+  // of the next zone anchor (yUpper), then perform the fade only inside that window.
+  let t: number;
+  const fadeWindow = viewHeight; // distance over which to blend (one screen height)
+  const fadeStartY = yUpper + fadeWindow; // start blending when camera midpoint rises above this
+  const fadeEndY = yUpper; // fully new zone at anchor
+  if(viewportMidYWorld >= fadeStartY){
+    // Still more than one screen height below next zone -> stick to lower zone
+    t = 0;
+  } else if(viewportMidYWorld <= fadeEndY){
+    // At or above the next zone anchor -> fully upper zone
+    t = 1;
+  } else {
+    // Within fade window: map viewportMidYWorld from [fadeStartY..fadeEndY] -> [0..1]
+    t = (fadeStartY - viewportMidYWorld) / (fadeStartY - fadeEndY);
+  }
+  // If the gap between zones is smaller than fadeWindow, fallback to proportional interpolation across gap.
+  const fullGap = yLower - yUpper;
+  if(fullGap < fadeWindow * 0.6){ // heuristic threshold
+    let proportional = (yLower - viewportMidYWorld) / fullGap; // 0 at yLower, 1 at yUpper
+    proportional = clamp(proportional, 0, 1);
+    // Use the greater of tight-window t and proportional so very short gaps still fade smoothly.
+    t = Math.max(t, proportional);
+  }
+  setAlpha(lowerZone.id, 1 - t);
+  setAlpha(upperZone.id, t);
+  currentZoneId = t < 0.5 ? lowerZone.id : upperZone.id;
+  // Safety: if for any reason both ended up zero (e.g., numerical edge), force lower visible.
+  if(jungleLayer.alpha===0 && carnivalLayer.alpha===0 && pirateLayer.alpha===0 && darkLayer.alpha===0 && tomorrowlandLayer.alpha===0){
+    setAlpha(lowerZone.id,1);
+    currentZoneId = lowerZone.id;
   }
 }
 
@@ -1195,6 +1285,24 @@ function ensureResetFab(){
   return btn;
 }
 
+function skipTutorial(){
+  try{ closeModal(); }catch{}
+  // Expand board if still on tutorial size.
+  if(LEVEL_COUNT < 300){
+    transitionToMainBoard();
+  } else {
+    progress.current = 30; saveProgress(progress);
+    positionPlayer(progress.current, true);
+    centerCameraOnLevel(progress.current, true);
+  }
+  dayState.day = 30; dayState.rollUsed = false; saveDayState(); updateDayUI();
+  // Remove button (no longer needed)
+  const btn = document.querySelector('.skip-tutorial-fab'); if(btn) btn.remove();
+  updateZoneCrossfade();
+  console.log('[SkipTutorial] Skipped tutorial -> Day 30, Level 30, board expanded.');
+}
+(window as any).skipTutorial = skipTutorial;
+
 function updateTokenCounter() { const span = document.querySelector('.token-counter .token-count'); if(span) span.textContent = String(tokens); }
 function updateCurrencyCounters(){
   updateTokenCounter();
@@ -1485,6 +1593,14 @@ function initDebugOverlay() {
           debugButtonsEl.appendChild(mkBtn('Force Slot', 'slot'));
           debugButtonsEl.appendChild(mkBtn('Force Spin Wheel', 'spin_wheel'));
           debugButtonsEl.appendChild(mkBtn('Force Loot Box', 'lootbox'));
+          // Skip Tutorial (dev convenience)
+          const skipBtn = document.createElement('button');
+          skipBtn.type='button'; skipBtn.textContent='Skip Tutorial';
+          Object.assign(skipBtn.style, { cursor:'pointer', background:'#222', color:'#fff', border:'1px solid #444', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
+          skipBtn.addEventListener('mouseenter', ()=>{ skipBtn.style.background = '#333'; });
+          skipBtn.addEventListener('mouseleave', ()=>{ skipBtn.style.background = '#222'; });
+          skipBtn.addEventListener('click', ()=>{ if(isTutorialActive(dayState.day)){ skipTutorial(); updateDebugOverlay(); } });
+          debugButtonsEl.appendChild(skipBtn);
           // Force Jackpot (Prize Star big game)
           const jackpotBtn = document.createElement('button');
           jackpotBtn.type='button';

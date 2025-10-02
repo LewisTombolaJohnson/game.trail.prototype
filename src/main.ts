@@ -657,26 +657,38 @@ function positionPlayer(level: number, instant = false, duration = 600) {
 function levelToY(level:number){ return positions[level-1]?.y ?? 0; }
 const ZONE_BLEND_HALF = 400;
 function updateZoneCrossfade(){
-  const viewportMidYWorld = -world.position.y + viewHeight/2;
-  const zonesWithY = ZONES.map(z=> ({ id:z.id, y: levelToY(z.startLevel) })).sort((a,b)=> a.y - b.y);
-  let lower = zonesWithY[0];
-  let upper: typeof lower | null = null;
-  for(const z of zonesWithY){ if(viewportMidYWorld >= z.y) lower = z; else { upper = z; break; } }
-  // Reset all alphas
+  // Determine current level-based fade rather than camera position.
+  const lvl = progress.current; // anchor to player progression
+  // Find the next zone boundary (startLevel) that is > current level
+  const sorted = [...ZONES].sort((a,b)=> a.startLevel - b.startLevel);
+  let currentZone = sorted[0];
+  let nextZone: ZoneDef | null = null;
+  for(const z of sorted){ if(lvl >= z.startLevel) currentZone = z; else { nextZone = z; break; } }
+  // Fade begins exactly one tile before the next zone's startLevel
+  const fadeStartLevel = nextZone ? nextZone.startLevel - 1 : null;
+  const fadeEndLevel = nextZone ? nextZone.startLevel : null;
+  // Reset
   jungleLayer.alpha = carnivalLayer.alpha = pirateLayer.alpha = darkLayer.alpha = tomorrowlandLayer.alpha = 0;
-  if(!upper){
-    // Beyond final threshold
-    const id = lower.id as ZoneId;
-    if(id==='Tomorrowland') tomorrowlandLayer.alpha=1; else if(id==='DarkUniverse') darkLayer.alpha=1; else if(id==='Pirate') pirateLayer.alpha=1; else if(id==='Carnival') carnivalLayer.alpha=1; else jungleLayer.alpha=1;
-    currentZoneId = id; return;
-  }
-  const centerY = (lower.y + upper.y)/2;
-  const halfSpan = (upper.y - lower.y)/2 + ZONE_BLEND_HALF;
-  const dy = viewportMidYWorld - centerY;
-  const t = clamp((dy + halfSpan)/(halfSpan*2), 0, 1);
   function setAlpha(id:ZoneId,a:number){ if(id==='Jungle') jungleLayer.alpha=a; else if(id==='Carnival') carnivalLayer.alpha=a; else if(id==='Pirate') pirateLayer.alpha=a; else if(id==='DarkUniverse') darkLayer.alpha=a; else tomorrowlandLayer.alpha=a; }
-  setAlpha(lower.id as ZoneId, 1-t); setAlpha(upper.id as ZoneId, t);
-  currentZoneId = t < 0.5 ? lower.id as ZoneId : upper.id as ZoneId;
+  if(!nextZone){
+    setAlpha(currentZone.id as ZoneId, 1);
+    currentZoneId = currentZone.id as ZoneId;
+    return;
+  }
+  if(fadeStartLevel!==null && lvl >= fadeStartLevel && lvl < fadeEndLevel!){
+    // Interpolate across just this single-level span (two steps: level fadeStart -> fadeEnd)
+  const t = clamp((lvl - fadeStartLevel) / ((fadeEndLevel! - fadeStartLevel) || 1), 0, 1);
+    setAlpha(currentZone.id as ZoneId, 1 - t);
+    setAlpha(nextZone.id as ZoneId, t);
+    currentZoneId = (t < 0.5 ? currentZone.id : nextZone.id) as ZoneId;
+  } else if(lvl < fadeStartLevel!){
+    setAlpha(currentZone.id as ZoneId, 1);
+    currentZoneId = currentZone.id as ZoneId;
+  } else {
+    // Past the boundary
+    setAlpha(nextZone.id as ZoneId, 1);
+    currentZoneId = nextZone.id as ZoneId;
+  }
 }
 
 function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>) {

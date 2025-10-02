@@ -30,15 +30,18 @@ let BOTTOM_VISIBLE_PADDING = 260; // includes dice bar clearance
 // Dynamic tile radius (updated on viewport compute) so tiles scale slightly on small screens but capped on large.
 let TILE_RADIUS = 38; // default; recomputed each resize
 
-// ---------------- Zones ----------------
-// Zone 1: Jungle (levels 1-14) | Zone 2: Carnival (levels 15-30)
-const ZONE_BOUNDARY_LEVEL = 15; // entering this level begins Carnival zone
-interface ZoneDef { id: string; startLevel: number; bgTexture?: Texture|null; }
+// ---------------- Zones (extended to 300 levels after tutorial) ----------------
+// Jungle (1-14), Carnival (15-99), Pirate (100-199), Dark Universe (200-299), Tomorrowland (300)
+type ZoneId = 'Jungle' | 'Carnival' | 'Pirate' | 'DarkUniverse' | 'Tomorrowland';
+interface ZoneDef { id: ZoneId; startLevel: number; }
 const ZONES: ZoneDef[] = [
   { id: 'Jungle', startLevel: 1 },
-  { id: 'Carnival', startLevel: ZONE_BOUNDARY_LEVEL }
+  { id: 'Carnival', startLevel: 15 },
+  { id: 'Pirate', startLevel: 100 },
+  { id: 'DarkUniverse', startLevel: 200 },
+  { id: 'Tomorrowland', startLevel: 300 }
 ];
-let currentZoneId = 'Jungle'; // Forced to 'Carnival' during tutorial days (1-8)
+let currentZoneId: ZoneId = 'Jungle';
 
 interface ProgressState { current: number }
 interface LevelPos { x: number; y: number }
@@ -462,7 +465,11 @@ const app = new Application();
 const backgroundLayer = new Container(); // parent
 const jungleLayer = new Container();
 const carnivalLayer = new Container();
-backgroundLayer.addChild(jungleLayer, carnivalLayer);
+// Newly added extended zone layers
+const pirateLayer = new Container();
+const darkLayer = new Container();
+const tomorrowlandLayer = new Container();
+backgroundLayer.addChild(jungleLayer, carnivalLayer, pirateLayer, darkLayer, tomorrowlandLayer);
 const world = new Container(); // moves with camera
 const trailLayer = new Container();
 const levelLayer = new Container();
@@ -646,22 +653,30 @@ function positionPlayer(level: number, instant = false, duration = 600) {
   tween(playerToken, { x: targetX, y: targetY }, duration, easeInOutCubic);
 }
 
-// ---------------- Zone Crossfade Logic ----------------
+// ---------------- Multi-Zone Crossfade Logic ----------------
 function levelToY(level:number){ return positions[level-1]?.y ?? 0; }
-// Determine a vertical boundary Y using boundary level position; crossfade across a vertical band
-function getZoneBoundaryY(){ return levelToY(ZONE_BOUNDARY_LEVEL); }
-// Size of blend band in pixels (above & below boundary center)
-const ZONE_BLEND_HALF = 400; // tune for smoother / longer transition
+const ZONE_BLEND_HALF = 400;
 function updateZoneCrossfade(){
-  // Compute midpoint of viewport (world space)
   const viewportMidYWorld = -world.position.y + viewHeight/2;
-  const boundaryY = getZoneBoundaryY();
-  const dy = viewportMidYWorld - boundaryY; // negative means below boundary (earlier levels)
-  // Map dy into 0..1 fade: when dy <= -ZONE_BLEND_HALF => jungle=1; when dy >= ZONE_BLEND_HALF => carnival=1
-  const t = clamp((dy + ZONE_BLEND_HALF) / (ZONE_BLEND_HALF*2), 0, 1);
-  jungleLayer.alpha = 1 - t;
-  carnivalLayer.alpha = t;
-  if(isTutorialActive(dayState.day)) currentZoneId = 'Carnival'; else currentZoneId = t < 0.5 ? 'Jungle' : 'Carnival';
+  const zonesWithY = ZONES.map(z=> ({ id:z.id, y: levelToY(z.startLevel) })).sort((a,b)=> a.y - b.y);
+  let lower = zonesWithY[0];
+  let upper: typeof lower | null = null;
+  for(const z of zonesWithY){ if(viewportMidYWorld >= z.y) lower = z; else { upper = z; break; } }
+  // Reset all alphas
+  jungleLayer.alpha = carnivalLayer.alpha = pirateLayer.alpha = darkLayer.alpha = tomorrowlandLayer.alpha = 0;
+  if(!upper){
+    // Beyond final threshold
+    const id = lower.id as ZoneId;
+    if(id==='Tomorrowland') tomorrowlandLayer.alpha=1; else if(id==='DarkUniverse') darkLayer.alpha=1; else if(id==='Pirate') pirateLayer.alpha=1; else if(id==='Carnival') carnivalLayer.alpha=1; else jungleLayer.alpha=1;
+    currentZoneId = id; return;
+  }
+  const centerY = (lower.y + upper.y)/2;
+  const halfSpan = (upper.y - lower.y)/2 + ZONE_BLEND_HALF;
+  const dy = viewportMidYWorld - centerY;
+  const t = clamp((dy + halfSpan)/(halfSpan*2), 0, 1);
+  function setAlpha(id:ZoneId,a:number){ if(id==='Jungle') jungleLayer.alpha=a; else if(id==='Carnival') carnivalLayer.alpha=a; else if(id==='Pirate') pirateLayer.alpha=a; else if(id==='DarkUniverse') darkLayer.alpha=a; else tomorrowlandLayer.alpha=a; }
+  setAlpha(lower.id as ZoneId, 1-t); setAlpha(upper.id as ZoneId, t);
+  currentZoneId = t < 0.5 ? lower.id as ZoneId : upper.id as ZoneId;
 }
 
 function drawCircleForState(g: Graphics, state: ReturnType<typeof computeState>) {
@@ -2317,8 +2332,8 @@ function advanceDayWithTransition(){
 
 // Expand from tutorial board (1-30) to main board (1-100) and place player at tile 30 start of new journey
 function transitionToMainBoard(){
-  // Increase level cap
-  LEVEL_COUNT = 100;
+  // Increase level cap (extended world)
+  LEVEL_COUNT = 300;
   // Place player at tile 30 (end of tutorial trail). Ensure progress saved.
   progress.current = 30; saveProgress(progress);
   // Regenerate category & minigame assignments for enlarged board (fresh spread) keeping player position.

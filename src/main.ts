@@ -52,7 +52,8 @@ const MINIGAME_ASSIGN_KEY = 'minigameAssignmentsV1';
 const CURRENCY_KEY = 'currenciesV1';
 const CATEGORY_ASSIGN_KEY = 'categoryAssignmentsV1';
 const DAY_STATE_KEY = 'dayStateV1';
-const STREAK_STATE_KEY = 'streakStateV1';
+const STREAK_STATE_KEY = 'streakStateV1'; // legacy key retained for migration
+const LEVEL_STATE_KEY = 'levelStateV1';
 
 interface DayState { day: number; rollUsed: boolean }
 let dayState: DayState = { day: 1, rollUsed: false };
@@ -69,18 +70,22 @@ function loadDayState(){
 }
 function saveDayState(){ localStorage.setItem(DAY_STATE_KEY, JSON.stringify(dayState)); }
 
-// Streak state (consecutive days where roll was used before advancing day)
-interface StreakState { streak: number }
-let streakState: StreakState = { streak: 0 };
-function loadStreakState(){
+// Player level state (replaces streak)
+interface LevelState { level: number }
+let levelState: LevelState = { level: 1 };
+function loadLevelState(){
   try {
-    const raw = localStorage.getItem(STREAK_STATE_KEY);
-    if(!raw) return;
-    const data = JSON.parse(raw);
-    if(typeof data.streak==='number' && data.streak>=0){ streakState.streak = Math.floor(data.streak); }
+    // Migrate legacy streak to level 1 if no level saved yet
+    const raw = localStorage.getItem(LEVEL_STATE_KEY);
+    if(raw){
+      const data = JSON.parse(raw);
+      if(typeof data.level==='number' && data.level>=1){ levelState.level = Math.floor(data.level); }
+    } else {
+      // If old streak existed, we could map it loosely (e.g., every 5 streaks = 1 level). For now just start at 1.
+    }
   } catch {}
 }
-function saveStreakState(){ localStorage.setItem(STREAK_STATE_KEY, JSON.stringify(streakState)); }
+function saveLevelState(){ localStorage.setItem(LEVEL_STATE_KEY, JSON.stringify(levelState)); }
 
 // Category assignments (supersede classic minigame-only approach)
 let categoryAssignments: CategoryAssignment[] = [];
@@ -208,28 +213,7 @@ function addPrizeStars(n:number){ if(n>0){ prizeStars+=n; saveCurrencies(); upda
 // Minigame assignments
 let minigameAssignments: MinigameAssignment[] = [];
 function loadMinigameAssignments() {
-    // Compact top-left reset button (detached from currency cluster)
-    if(!document.querySelector('.reset-fab')){
-      const resetBtn = document.createElement('button');
-      resetBtn.type='button';
-      resetBtn.className='reset-fab';
-      resetBtn.textContent='Reset';
-      resetBtn.title='Reset progress';
-      resetBtn.ariaLabel='Reset progress';
-      document.body.appendChild(resetBtn);
-      resetBtn.addEventListener('click', () => {
-        if(confirm('Reset your progress?')){
-          // Delegate to existing logic by triggering original handler body (inline duplicated minimal)
-          const btn = document.querySelector('[data-action="reset"]') as HTMLButtonElement | null; // backward compat if present
-          if(btn){ btn.click(); return; }
-          // Fallback: invoke the inline code path directly (call internal reset logic)
-          // Reuse existing reset handler code by factoring into a function (if refactor later). For now mimic user click.
-          // Minimal duplication: call internal sequence via a synthetic function if accessible.
-          // We'll just perform a location reload as ultimate fallback (fresh state) if internal API changes.
-          // (No-op because primary handler still exists below in code until removed; safe guard.)
-        }
-      });
-    }
+    ensureResetFab();
   try {
     const raw = localStorage.getItem(MINIGAME_ASSIGN_KEY);
     if (!raw) return false;
@@ -392,7 +376,18 @@ let tokens = 0;
 function loadTokens() { try { const raw = localStorage.getItem(TOKEN_STORAGE_KEY); if(!raw) return 0; const n = Number(raw); return Number.isFinite(n)&&n>=0?Math.floor(n):0; } catch { return 0; } }
 function saveTokens() { localStorage.setItem(TOKEN_STORAGE_KEY, String(tokens)); }
 // (removed duplicate updateTokenCounter definition - consolidated earlier)
-function addTokens(n:number){ if(n>0){ tokens+=n; saveTokens(); updateTokenCounter(); } }
+// Dual-choice milestone flags
+let tokenDualPopupReady = false; // becomes true once threshold crossed
+let tokenDualPopupConsumed = false; // set true once popup opened & tokens deducted
+function addTokens(n:number){
+  if(n>0){
+    const prev = tokens;
+    tokens+=n; saveTokens(); updateTokenCounter();
+    if(!tokenDualPopupConsumed && prev < 120 && tokens >= 120){
+      tokenDualPopupReady = true; // will be shown end-of-day
+    }
+  }
+}
 tokens = loadTokens();
 
 let positions = generateVerticalPositions(LEVEL_COUNT);
@@ -416,7 +411,7 @@ app.stage.addChild(world);
 async function initApp() {
   loadCurrencies();
   loadDayState();
-  loadStreakState();
+  loadLevelState();
   ensureCategoryAssignments(); // new category system (includes embedded minigames)
   await app.init({ backgroundAlpha: 0, antialias: true, width: viewWidth, height: viewHeight, autoDensity: true });
   const rootEl = document.getElementById('pixi-root');
@@ -957,7 +952,7 @@ function renderControls() {
       <div class="currency-bar vertical" aria-label="Currencies">
         <div class="currency-meta" aria-label="Meta Progress">
           <div class="currency day-counter pill" title="Current Day"><span class="label">Day</span><span class="day-count">1</span></div>
-          <div class="currency streak-counter pill" title="Daily Streak (consecutive active days)"><span class="label">Streak</span><span class="streak-count">0</span></div>
+          <div class="currency level-counter pill" title="Player Level"><span class="label">Lvl</span><span class="level-count">1</span></div>
           <div class="prize-star-progress" title="Prize Star Progress" aria-label="Prize Star Progress">
             <div class="ps-progress-bar"><div class="ps-progress-fill"></div></div>
             <div class="ps-progress-label"><span class="ps-progress-count">0</span>/5 ⭐</div>
@@ -996,12 +991,16 @@ function renderControls() {
         .currency-bar .pill{display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(20,24,28,0.6);border:1px solid #2a333c;border-radius:18px;backdrop-filter:blur(4px);} 
         .currency-bar .pill .label{opacity:0.85;font-size:12px;letter-spacing:.5px;} 
         .currency-bar .cash-counter .label{font-size:15px;line-height:1;} 
-        .currency-bar img.token-icon{width:18px;height:18px;display:block;}
-        .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
-  .prize-star-progress{display:flex;flex-direction:column;gap:4px;padding:6px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:140px;}
-  .ps-progress-bar{position:relative;width:100%;height:10px;background:#1f262d;border:1px solid #36424d;border-radius:6px;overflow:hidden;}
-  .ps-progress-fill{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.6) inset,0 0 4px rgba(255,159,67,0.55);transition:width .5s cubic-bezier(.4,.8,.2,1),filter .5s;}
-  .ps-progress-label{font-size:11px;font-weight:600;letter-spacing:.5px;text-align:center;opacity:.85;}
+    .currency-bar img.token-icon{width:18px;height:18px;display:block;}
+    .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
+  .prize-star-progress{position:relative;display:flex;flex-direction:column;padding:6px 8px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:150px;}
+  .ps-progress-bar{position:relative;width:100%;height:24px;background:#1f262d;border:1px solid #36424d;border-radius:10px;overflow:hidden;display:flex;align-items:center;}
+  .ps-progress-fill{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.6) inset,0 0 4px rgba(255,159,67,0.55);transition:width .6s cubic-bezier(.4,.8,.2,1),filter .5s;}
+  /* Adjust vertical nudge of label here via translateY */
+  .ps-progress-label{pointer-events:none;position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;letter-spacing:.6px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.9),0 0 4px rgba(0,0,0,0.55);transform:translateY(-1px);} 
+  .prize-star-progress .ps-progress-label .ps-progress-count{margin-right:4px;}
+  .prize-star-progress.compact{padding:4px 6px 6px;}
+  .ps-progress-complete .ps-progress-label{color:#222;}
   .ps-progress-complete .ps-progress-fill{filter:drop-shadow(0 0 6px #ff9f43) drop-shadow(0 0 12px rgba(255,159,67,.75));animation:psPulse 1.6s ease-in-out infinite alternate;}
   @keyframes psPulse{0%{opacity:1;}100%{opacity:.6;}}
         .controls button.next-day{background:#304050;color:#fff;border:1px solid #456075;padding:8px 14px;font-weight:600;border-radius:10px;cursor:pointer;transition:background .25s,box-shadow .25s;}
@@ -1019,62 +1018,58 @@ function renderControls() {
       document.head.appendChild(style);
     }
   }
-  controls.querySelector('[data-action="reset"]')?.addEventListener('click', () => {
-    if (confirm('Reset your progress?')) {
-      // Close any open modal / overlay first
-      closeModal();
-      progress.current = 1;
-      saveProgress(progress);
-      // Clear completion / resolution on all category & minigame assignments so no tiles stay green
-      categoryAssignments.forEach(a=>{ a.completed = false; if(a.category==='mystery'){ delete a.resolvedAs; } });
-      saveCategoryAssignments();
-      minigameAssignments.forEach(m=>{ m.completed = false; });
-      saveMinigameAssignments();
-      // Reset currencies (tokens & others)
-      tokens = 0; saveTokens();
-  freePlays = 0; cashPence = 0; bonusPence = 0; streakKeys = 0; prizeStars = 0; saveCurrencies();
-      updateCurrencyCounters();
-      // Reset day state too & re-enable roll
-      dayState.day = 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
-      // Reset streak state
-      streakState.streak = 0; saveStreakState(); updateStreakUI();
-      // Remove any inline next day button and restore dice visibility
-      document.querySelectorAll('.inline-next-day-btn').forEach(el=> el.remove());
-      const diceBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null;
-      if(diceBtn){
-        diceBtn.style.display='';
-        diceBtn.disabled = false;
-        diceBtn.classList.remove('daily-used');
-        diceBtn.classList.add('can-roll');
-      }
-      // Allow jackpot to be earned again on fresh tutorial day
-      if(typeof prizeStarJackpotPlayedToday !== 'undefined') prizeStarJackpotPlayedToday = false;
-      // Reset any minigame/day completion flags so evaluation doesn't instantly show next-day
-      dayMinigameCompleted = false;
-      // Restore tutorial-sized board (hide extended 31..100) by shrinking LEVEL_COUNT and regenerating structure
-      LEVEL_COUNT = 30; // revert to original tutorial board size
-      // Regenerate assignments for the 30-tile tutorial board
-      generateMinigameAssignments();
-      generateCategoryAssignments();
-      refreshStates();
-      positionPlayer(progress.current, true);
-      centerCameraOnLevel(progress.current, true);
-      // Rebuild trail visuals to physically remove tiles >30 if they were present
-      trailLayer.removeChildren(); levelLayer.removeChildren(); connectors.splice(0, connectors.length); levelNodes.splice(0, levelNodes.length);
-      positions = generateVerticalPositions(LEVEL_COUNT);
-      height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
-      app.renderer.resize(viewWidth, viewHeight);
-      buildTrail(); createLevels(); refreshStates(); positionPlayer(progress.current, true);
-      // Fire start_day popups shortly after reset (allow camera recenter)
-      setTimeout(()=> maybeApplyTutorialPopups('start_day'), 400);
-    }
-  });
+  // Legacy inline reset button removed; ensure floating fab is present
+  ensureResetFab();
   // next-day button now injected dynamically in place of dice when day complete
   updateResetButton();
   updateTokenCounter();
   updateDayUI();
 }
 function updateResetButton() { const btn = document.querySelector('[data-action="reset"]') as HTMLButtonElement | null; if (btn) btn.disabled = progress.current === 1; }
+
+// Centralized full reset routine (used by inline button & floating reset-fab)
+function performFullReset(){
+  closeModal();
+  progress.current = 1; saveProgress(progress);
+  categoryAssignments.forEach(a=>{ a.completed = false; if(a.category==='mystery'){ delete a.resolvedAs; } }); saveCategoryAssignments();
+  minigameAssignments.forEach(m=>{ m.completed = false; }); saveMinigameAssignments();
+  tokens = 0; saveTokens();
+  freePlays = 0; cashPence = 0; bonusPence = 0; streakKeys = 0; prizeStars = 0; saveCurrencies(); updateCurrencyCounters();
+  dayState.day = 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
+  levelState.level = 1; saveLevelState(); updateLevelUI();
+  document.querySelectorAll('.inline-next-day-btn').forEach(el=> el.remove());
+  const diceBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null;
+  if(diceBtn){ diceBtn.style.display=''; diceBtn.disabled=false; diceBtn.classList.remove('daily-used'); diceBtn.classList.add('can-roll'); }
+  if(typeof prizeStarJackpotPlayedToday !== 'undefined') prizeStarJackpotPlayedToday = false;
+  dayMinigameCompleted = false;
+  LEVEL_COUNT = 30;
+  generateMinigameAssignments();
+  generateCategoryAssignments();
+  refreshStates();
+  positionPlayer(progress.current, true);
+  centerCameraOnLevel(progress.current, true);
+  trailLayer.removeChildren(); levelLayer.removeChildren(); connectors.splice(0, connectors.length); levelNodes.splice(0, levelNodes.length);
+  positions = generateVerticalPositions(LEVEL_COUNT);
+  height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
+  app.renderer.resize(viewWidth, viewHeight);
+  buildTrail(); createLevels(); refreshStates(); positionPlayer(progress.current, true);
+  setTimeout(()=> maybeApplyTutorialPopups('start_day'), 400);
+  updateResetButton();
+}
+
+function ensureResetFab(){
+  let btn = document.querySelector('.reset-fab') as HTMLButtonElement | null;
+  if(!btn){
+    btn = document.createElement('button');
+    btn.type='button';
+    btn.className='reset-fab';
+    btn.innerHTML='<span class="rf-icon" style="font-size:14px;line-height:1;">↺</span><span class="rf-label" style="margin-left:6px;">Reset</span>';
+    btn.title='Reset progress'; btn.ariaLabel='Reset progress';
+    document.body.appendChild(btn);
+    btn.addEventListener('click',()=>{ if(confirm('Reset your progress?')) performFullReset(); });
+  }
+  return btn;
+}
 
 function updateTokenCounter() { const span = document.querySelector('.token-counter .token-count'); if(span) span.textContent = String(tokens); }
 function updateCurrencyCounters(){
@@ -1085,6 +1080,7 @@ function updateCurrencyCounters(){
   const sk = document.querySelector('.sk-count'); if(sk) sk.textContent = String(streakKeys);
   const ps = document.querySelector('.ps-count'); if(ps) ps.textContent = String(prizeStars);
   updatePrizeStarProgress();
+  updateLevelUI();
 }
 function updatePrizeStarProgress(){
   const wrap = document.querySelector('.prize-star-progress'); if(!wrap) return;
@@ -1099,7 +1095,7 @@ function updatePrizeStarProgress(){
 }
 function updateDayUI(){
   const daySpan = document.querySelector('.day-count'); if(daySpan) daySpan.textContent = String(dayState.day);
-  updateStreakUI();
+  updateLevelUI();
   const rollBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null; 
   if(rollBtn){
     if(dayState.rollUsed){
@@ -1115,8 +1111,8 @@ function updateDayUI(){
   // Dynamic next-day button state handled by evaluateDayCompletion
 }
 
-function updateStreakUI(){
-  const streakSpan = document.querySelector('.streak-count'); if(streakSpan) streakSpan.textContent = String(streakState.streak);
+function updateLevelUI(){
+  const levelSpan = document.querySelector('.level-count'); if(levelSpan) levelSpan.textContent = String(levelState.level);
 }
 
 function openModal(level: number) {
@@ -1382,6 +1378,42 @@ function initDebugOverlay() {
             openPrizeStarJackpot();
           });
           debugButtonsEl.appendChild(jackpotBtn);
+          // Force Dual Choice overlay (120 token milestone) & subgames
+          const dualBtn = document.createElement('button');
+          dualBtn.type='button'; dualBtn.textContent='Force Dual Choice';
+          Object.assign(dualBtn.style, {
+            cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+            borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+          });
+          dualBtn.addEventListener('mouseenter', ()=>{ dualBtn.style.background = '#333'; });
+          dualBtn.addEventListener('mouseleave', ()=>{ dualBtn.style.background = '#222'; });
+          dualBtn.addEventListener('click', ()=>{
+            tokenDualPopupReady = true; tokenDualPopupConsumed = false; // re-arm
+            openDualThresholdOverlay();
+          });
+          debugButtonsEl.appendChild(dualBtn);
+
+          const specialScratchBtn = document.createElement('button');
+          specialScratchBtn.type='button'; specialScratchBtn.textContent='Force Special Scratch';
+          Object.assign(specialScratchBtn.style, {
+            cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+            borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+          });
+          specialScratchBtn.addEventListener('mouseenter', ()=>{ specialScratchBtn.style.background = '#333'; });
+          specialScratchBtn.addEventListener('mouseleave', ()=>{ specialScratchBtn.style.background = '#222'; });
+          specialScratchBtn.addEventListener('click', ()=>{ openSpecialScratchJackpotOverlay(); });
+          debugButtonsEl.appendChild(specialScratchBtn);
+
+          const megaBoxBtn = document.createElement('button');
+          megaBoxBtn.type='button'; megaBoxBtn.textContent='Force Mega Box';
+          Object.assign(megaBoxBtn.style, {
+            cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+            borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+          });
+          megaBoxBtn.addEventListener('mouseenter', ()=>{ megaBoxBtn.style.background = '#333'; });
+          megaBoxBtn.addEventListener('mouseleave', ()=>{ megaBoxBtn.style.background = '#222'; });
+          megaBoxBtn.addEventListener('click', ()=>{ openMegaBoxGameOverlay(); });
+          debugButtonsEl.appendChild(megaBoxBtn);
           // Close button for convenience
           const closeBtn = mkBtn('Close Debug (0)', 'slot');
           closeBtn.removeEventListener('click', ()=>{}); // remove earlier listener
@@ -1422,7 +1454,7 @@ function updateDebugOverlay() {
     `camera: (${camX}, ${camY})\n` +
     `progress: ${current}/${LEVEL_COUNT} visible:${visibleRange}\n` +
   `categories: ${catCount} minigames: ${mgCount}\n`+
-  `day: ${dayState.day} rollUsed:${dayState.rollUsed} streak:${streakState.streak}\n`+
+  `day: ${dayState.day} rollUsed:${dayState.rollUsed} level:${levelState.level}\n`+
   `zone: ${currentZoneId}`;
 }
 
@@ -2093,36 +2125,34 @@ function ensureTutorStyles(){
   style.textContent = `
   .tutor-modal{background:transparent !important;box-shadow:none !important;padding:0 !important;max-width:none !important;width:100% !important;}
   :root{--tutor-char-width:340px;--tutor-char-width-mobile:230px;--tutor-char-max-vw:60vw;--tutor-stage-top-shift:100px;--tutor-bubble-max:560px;--tutor-stage-max:600px;--tutor-stage-right-extra:50px;}
-  .tutor-stage{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;min-height:520px;padding:calc(46px + var(--tutor-stage-top-shift)) calc(24px + var(--tutor-stage-right-extra)) 56px 24px;gap:28px;width:100%;max-width:var(--tutor-stage-max);margin:0 auto;}
-  .tutor-speech{order:1;position:relative;max-width:var(--tutor-bubble-max);width:100%;margin:0 auto;}
+  /* Centered tutorial layout */
+  .tutor-stage{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100dvh;padding: clamp(16px,4vh,40px) clamp(16px,5vw,48px);gap:32px;width:100%;max-width:var(--tutor-stage-max);margin:0 auto; box-sizing:border-box;}
+  .tutor-speech{order:1;position:relative;max-width:var(--tutor-bubble-max);width:100%;margin:0 auto;display:flex;flex-direction:column;}
   .tutor-speech-inner{background:#1c232b;border:2px solid #ff9f43;border-radius:26px;padding:28px 30px 30px;box-shadow:0 14px 34px rgba(0,0,0,0.6);font-size:15px;line-height:1.6;}
   .tutor-speech-inner h2{margin:0 0 12px;font-size:22px;}
   .tutor-text{font-size:15px;}
   .tutor-actions{margin-top:22px;display:flex;justify-content:flex-end;}
-  .tutor-speech-arrow{position:absolute;left:50%;bottom:-48px;transform:translateX(-50%);width:0;height:0;border-left:42px solid transparent;border-right:42px solid transparent;border-top:48px solid #ff9f43;}
-  .tutor-speech-arrow:after{content:'';position:absolute;left:-32px;top:-48px;width:0;height:0;border-left:32px solid transparent;border-right:32px solid transparent;border-top:38px solid #1c232b;}
+  /* Arrow removed when centered */
+  .tutor-speech-arrow{display:none;}
+  .tutor-speech-arrow:after{display:none;}
   .tutor-portrait-wrap{order:2;display:flex;align-items:flex-end;justify-content:center;margin-top:12px;}
   .tutor-character{width:var(--tutor-char-width);max-width:var(--tutor-char-max-vw);height:auto;filter:drop-shadow(0 10px 18px rgba(0,0,0,.7));transition:transform .45s ease;image-rendering:auto;}
   .tutor-stage:hover .tutor-character{transform:translateY(4px);} 
   /* Responsive adjustments */
   @media (max-width:900px){
-    .tutor-stage{min-height:480px;padding:calc(40px + var(--tutor-stage-top-shift)) calc(22px + var(--tutor-stage-right-extra)) 60px 22px;}
+    .tutor-stage{padding: clamp(16px,4vh,34px) clamp(16px,5vw,42px);}
     .tutor-character{width:calc(var(--tutor-char-width) - 60px);}
     .tutor-speech-inner{padding:26px 24px 28px;font-size:14px;}
     .tutor-speech-inner h2{font-size:20px;}
-    .tutor-speech-arrow{bottom:-40px;border-left:36px solid transparent;border-right:36px solid transparent;border-top:42px solid #ff9f43;}
-    .tutor-speech-arrow:after{left:-28px;top:-42px;border-left:28px solid transparent;border-right:28px solid transparent;border-top:32px solid #1c232b;}
   }
   @media (max-width:560px){
-    .tutor-stage{min-height:430px;padding:calc(34px + var(--tutor-stage-top-shift)*0.6) calc(16px + var(--tutor-stage-right-extra)) 62px 16px;}
+    .tutor-stage{padding: clamp(12px,3vh,30px) 16px;}
     .tutor-character{width:var(--tutor-char-width-mobile);}
     .tutor-speech-inner{padding:22px 20px 24px;font-size:13px;}
     .tutor-speech-inner h2{font-size:19px;}
-    .tutor-speech-arrow{bottom:-36px;border-left:30px solid transparent;border-right:30px solid transparent;border-top:38px solid #ff9f43;}
-    .tutor-speech-arrow:after{left:-24px;top:-38px;border-left:24px solid transparent;border-right:24px solid transparent;border-top:30px solid #1c232b;}
   }
   @media (min-width:1280px){
-    .tutor-stage{min-height:560px;}
+    .tutor-stage{min-height:100dvh;}
     .tutor-character{width:380px;max-width:50vw;}
   }
   `;
@@ -2155,14 +2185,8 @@ function advanceDayWithTransition(){
   // After fade-in completes, increment day, show label for 3s, then fade out.
   const prevDay = dayState.day;
   setTimeout(()=>{
-    // Streak logic: only increment if the roll was actually used before advancing
-    if(dayState.rollUsed){ streakState.streak += 1; }
-    else { 
-      streakState.streak = 0; 
-      // Reset streak keys when streak breaks
-      if(streakKeys !== 0){ streakKeys = 0; saveCurrencies(); }
-    }
-    saveStreakState();
+    // Legacy streak removed; maintain streakKeys reset if roll not used
+    if(!dayState.rollUsed && streakKeys !== 0){ streakKeys = 0; saveCurrencies(); }
     maybeApplyTutorialPopups('end_day');
   dayState.day += 1; dayState.rollUsed = false; saveDayState();
   // If we just moved from final tutorial day (8 -> 9), expand board
@@ -2277,6 +2301,8 @@ function openChainedInfoModal(pages:string[]){
   if(withPortrait) ensureTutorStyles();
   if(withPortrait){
     modal.classList.add('tutor-modal');
+    backdrop.classList.add('tutor-backdrop');
+    backdrop.classList.add('tutor-backdrop');
     modal.innerHTML = `<div class='tutor-stage'>
         <div class='tutor-portrait-wrap'>
           <img src='${carnivalCharacterUrl}' alt='Guide' class='tutor-character'/>
@@ -2340,6 +2366,16 @@ function evaluateDayCompletion(){
   const needsMinigame = plan && plan.reward.kind==='minigame' && plan.reward.minigame;
   if(!dayState.rollUsed) return;
   if(needsMinigame && !dayMinigameCompleted) return;
+  // If milestone ready and not consumed, show after all other overlays/prompt sequences closed
+  if(tokenDualPopupReady && !tokenDualPopupConsumed){
+    // Ensure no tutorial or prize star jackpot is pending first
+    if(!document.querySelector('.modal-backdrop')){
+      if(tokens >= 120){ tokens -= 120; saveTokens(); updateTokenCounter(); }
+      tokenDualPopupConsumed = true; tokenDualPopupReady = false;
+      openDualThresholdOverlay();
+      return; // wait until user finishes chosen game before continuing day completion
+    }
+  }
   // Check prize star jackpot before enabling next day if threshold met and not yet played today
   if(prizeStars >=5 && !prizeStarJackpotPlayedToday){
     // Launch jackpot overlay (defer actual next-day button swap until after overlay)
@@ -2469,6 +2505,209 @@ function finalizeJackpotReward(r:Reward, resultEl:HTMLDivElement, closeBtn:HTMLB
   closeBtn.disabled = false;
 }
 
+// ================= 120 Token Dual Choice Overlay & Games =================
+function openDualThresholdOverlay(){
+  ensureDualStyles();
+  if(document.querySelector('.modal-backdrop')) return;
+  closeModal();
+  const backdrop = document.createElement('div');
+  backdrop.className='modal-backdrop dual-choice-backdrop';
+  const wrap = document.createElement('div');
+  wrap.className='dual-choice-wrap';
+  wrap.innerHTML = `
+    <div class='dual-choice-header'>
+      <h1>Milestone Unlocked!</h1>
+      <p>You reached 120 Tokens. Choose ONE premium bonus game.</p>
+    </div>
+    <div class='dual-choice-inner'>
+      <div class='choice left-choice' tabindex='0'>
+        <div class='dual-choice-badges'><span class='dual-choice-badge'>Guaranteed Win</span><span class='dual-choice-badge'>High Value</span></div>
+        <h2>Scratch Jackpot</h2>
+        <p>Scratch 3 premium panels. One high-tier reward is yours—no duds.</p>
+        <button type='button' class='primary play-left'>Play Scratch</button>
+      </div>
+      <div class='choice right-choice' tabindex='0'>
+        <div class='dual-choice-badges'><span class='dual-choice-badge'>Tension Build</span><span class='dual-choice-badge'>Big Range</span></div>
+        <h2>Mega Box Pick</h2>
+        <p>Keep one box, eliminate the rest, then decide: stay or switch at the end.</p>
+        <button type='button' class='primary play-right'>Play Mega Box</button>
+      </div>
+    </div>`;
+  backdrop.appendChild(wrap); document.body.appendChild(backdrop); document.body.classList.add('modal-open');
+  const toScratch = ()=>{ closeModal(); openSpecialScratchJackpotOverlay(); };
+  const toMega = ()=>{ closeModal(); openMegaBoxGameOverlay(); };
+  wrap.querySelector('.play-left')?.addEventListener('click', toScratch);
+  wrap.querySelector('.play-right')?.addEventListener('click', toMega);
+  const leftChoice = wrap.querySelector('.left-choice');
+  const rightChoice = wrap.querySelector('.right-choice');
+  if(leftChoice){ (leftChoice as HTMLElement).addEventListener('keydown', (e:any)=>{ const k=e.key||e.code; if(k==='Enter' || k===' ') { e.preventDefault(); toScratch(); }}); }
+  if(rightChoice){ (rightChoice as HTMLElement).addEventListener('keydown', (e:any)=>{ const k=e.key||e.code; if(k==='Enter' || k===' ') { e.preventDefault(); toMega(); }}); }
+  (leftChoice as HTMLElement)?.focus();
+}
+
+function ensureDualStyles(){
+  let style = document.getElementById('dual-choice-styles') as HTMLStyleElement | null;
+  if(!style){ style = document.createElement('style'); style.id='dual-choice-styles'; document.head.appendChild(style); }
+  style.textContent = `
+  .dual-choice-backdrop{backdrop-filter:blur(6px);}
+  .dual-choice-wrap{width:100%;max-width:1000px;display:flex;flex-direction:column;align-items:stretch;padding:28px 26px 34px;gap:26px;}
+  .dual-choice-header{text-align:center;}
+  .dual-choice-header h1{margin:0 0 8px;font-size:30px;background:linear-gradient(90deg,#ffb25b,#ff6d3b);-webkit-background-clip:text;color:transparent;letter-spacing:1px;font-weight:800;}
+  .dual-choice-header p{margin:0;font-size:15px;opacity:.85;letter-spacing:.5px;}
+  .dual-choice-inner{display:flex;gap:34px;flex-wrap:wrap;justify-content:center;width:100%;}
+  .dual-choice-inner .choice{position:relative;flex:1 1 360px;max-width:440px;background:linear-gradient(155deg,#111b23,#0c1217 60%,#181f26);border:2px solid rgba(255,159,67,0.65);border-radius:26px;padding:26px 28px 28px;display:flex;flex-direction:column;gap:14px;box-shadow:0 18px 40px -14px rgba(0,0,0,0.75),0 0 0 1px rgba(255,159,67,0.15);overflow:hidden;}
+  .dual-choice-inner .choice:before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 28% 18%,rgba(255,159,67,0.18),transparent 60%);pointer-events:none;}
+  .dual-choice-inner .choice h2{margin:0 0 4px;font-size:24px;letter-spacing:.5px;}
+  .dual-choice-inner .choice p{margin:0 0 10px;font-size:15px;line-height:1.55;opacity:.9;}
+  .dual-choice-inner .choice button{align-self:flex-start;transition:transform .18s ease,background .2s;}
+  .dual-choice-inner .choice:hover{border-color:#ffbc6e;box-shadow:0 18px 42px -14px rgba(0,0,0,0.8),0 0 0 1px rgba(255,188,110,0.35);}
+  .dual-choice-inner .choice:hover button{transform:translateY(-2px);}
+  .dual-choice-badges{display:flex;gap:10px;flex-wrap:wrap;}
+  .dual-choice-badge{background:#1f2d36;padding:4px 10px;border-radius:30px;font-size:11px;letter-spacing:.7px;font-weight:600;text-transform:uppercase;border:1px solid #314149;color:#ffb56a;}
+  @media(max-width:760px){ .dual-choice-inner{flex-direction:column;} .dual-choice-header h1{font-size:24px;} }
+  .special-scratch{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;max-width:420px;margin:0 auto 20px;}
+  .special-scratch button{position:relative;height:90px;background:#222;border:2px solid #555;border-radius:14px;cursor:pointer;font-weight:700;color:#ffcf9a;font-size:15px;letter-spacing:.5px;display:flex;align-items:center;justify-content:center;transition:background .2s,border-color .2s,transform .18s;}
+  .special-scratch button:not(.revealed):hover{background:#2b2b2b;transform:translateY(-3px);} 
+  .special-scratch button.revealed{background:#333;border-color:#ff9f43;}
+  .mega-box-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;max-width:640px;margin:0 auto 16px;}
+  .mega-box-grid button{height:86px;background:#1b2228;border:2px solid #3a4550;border-radius:12px;color:#fff;font-weight:600;cursor:pointer;letter-spacing:.5px;font-size:14px;position:relative;transition:background .18s,border-color .18s,transform .18s;}
+  .mega-box-grid button:not(.opened):hover{background:#25323a;transform:translateY(-3px);} 
+  .mega-box-grid button.kept{outline:3px solid #ff9f43;}
+  .mega-box-grid button.eliminated{background:#101417;border-color:#222;color:#555;}
+  .mega-box-grid button.final{animation:pulseFinal 1.4s ease-in-out infinite alternate;}
+  @keyframes pulseFinal{0%{box-shadow:0 0 0 0 rgba(255,159,67,0.4);}100%{box-shadow:0 0 0 6px rgba(255,159,67,0.0);} }
+  .mega-status{min-height:52px;text-align:center;font-size:15px;font-weight:600;letter-spacing:.5px;}
+  .mega-decisions{display:flex;justify-content:center;gap:18px;margin:6px 0 10px;}
+  .mega-decisions button{min-width:140px;}
+  .mega-close-row{display:flex;justify-content:center;margin-top:8px;}
+  .mega-close-row button{min-width:160px;}
+  `;
+}
+
+function openSpecialScratchJackpotOverlay(){
+  ensureDualStyles();
+  closeModal();
+  const backdrop = document.createElement('div'); backdrop.className='modal-backdrop';
+  const modal = document.createElement('div'); modal.className='modal';
+  modal.style.maxWidth='680px';
+  modal.innerHTML = `<h2 style='text-align:center;margin:0 0 10px;'>Grand Scratch Bonus</h2>
+    <p style='text-align:center;margin:0 0 16px;font-size:14px;'>Scratch any 3 panels. One of the displayed rewards will be yours!</p>
+    <div class='special-scratch'></div>
+    <div class='jackpot-result' style='text-align:center;font-weight:600;font-size:16px;min-height:34px;'></div>
+    <div class='modal-footer' style='justify-content:center;'><button class='primary close-special' type='button' disabled>Close</button></div>`;
+  const grid = modal.querySelector('.special-scratch') as HTMLDivElement;
+  const resultEl = modal.querySelector('.jackpot-result') as HTMLDivElement;
+  const closeBtn = modal.querySelector('.close-special') as HTMLButtonElement;
+  const rewards: Reward[] = [
+    { kind:'freePlays', amount:15, label:'15 Free Plays' },
+    { kind:'bonus', amount:1500, label:'£15 Bonus Money' },
+    { kind:'cash', amount:1000, label:'£10 Cash' }
+  ];
+  let revealed=0; let finalReward: Reward | null = null;
+  for(let i=0;i<9;i++){
+    const btn = document.createElement('button'); btn.type='button'; btn.textContent='SCRATCH';
+    btn.addEventListener('click',()=>{
+      if(btn.classList.contains('revealed')) return;
+      revealed++;
+      if(revealed<=3){
+        const pick = rewards[revealed-1];
+        btn.textContent = pick.label; finalReward = pick; btn.classList.add('revealed');
+        if(revealed===3 && finalReward){
+          applyReward(finalReward); resultEl.innerHTML = `<p><strong>You won ${finalReward.label}!</strong></p>`; closeBtn.disabled=false;
+        }
+      } else {
+        btn.textContent='—'; btn.classList.add('revealed');
+      }
+    });
+    grid.appendChild(btn);
+  }
+  backdrop.appendChild(modal); document.body.appendChild(backdrop); document.body.classList.add('modal-open');
+  closeBtn.addEventListener('click',()=>{ if(!closeBtn.disabled) closeModal(); });
+}
+
+function openMegaBoxGameOverlay(){
+  ensureDualStyles();
+  closeModal();
+  const backdrop = document.createElement('div'); backdrop.className='modal-backdrop';
+  const modal = document.createElement('div'); modal.className='modal'; modal.style.maxWidth='860px';
+  modal.innerHTML = `<button class='close-x' aria-label='Close' style='position:absolute;top:10px;right:10px;background:#222;border:1px solid #444;color:#fff;border-radius:50%;width:34px;height:34px;font-size:16px;cursor:pointer;'>&times;</button>
+    <h2 style='text-align:center;margin:0 0 10px;'>Mega Box Pick</h2>
+    <p style='text-align:center;margin:0 0 14px;font-size:14px;'>Pick a box to keep. Eliminate the rest. When only one other box remains, decide to <strong>Keep</strong> or <strong>Switch</strong>. The unchosen final box will always be Nothing.</p>
+    <div class='mega-box-grid'></div>
+    <div class='mega-status'></div>
+    <div class='mega-decisions' style='display:none;'>
+      <button type='button' class='primary keep-choice' disabled>Keep My Box</button>
+      <button type='button' class='secondary switch-choice' disabled>Switch Boxes</button>
+    </div>
+    <div class='mega-close-row' style='display:none;'>
+      <button type='button' class='primary close-mega'>Close</button>
+    </div>`;
+  const grid = modal.querySelector('.mega-box-grid') as HTMLDivElement;
+  const statusEl = modal.querySelector('.mega-status') as HTMLDivElement;
+  const keepBtn = modal.querySelector('.keep-choice') as HTMLButtonElement;
+  const switchBtn = modal.querySelector('.switch-choice') as HTMLButtonElement;
+  const decisionsRow = modal.querySelector('.mega-decisions') as HTMLDivElement;
+  const closeRow = modal.querySelector('.mega-close-row') as HTMLDivElement;
+  const closeBtnTop = modal.querySelector('.close-x') as HTMLButtonElement;
+  const closeBtnBottom = modal.querySelector('.close-mega') as HTMLButtonElement;
+  closeBtnTop.addEventListener('click', closeModal); closeBtnBottom.addEventListener('click', closeModal);
+  const rewardPool: Reward[] = [
+    { kind:'cash', amount:2000, label:'£20 Cash' },
+    { kind:'bonus', amount:2500, label:'£25 Bonus' },
+    { kind:'freePlays', amount:20, label:'20 Free Plays' },
+    { kind:'cash', amount:1000, label:'£10 Cash' },
+    { kind:'bonus', amount:1500, label:'£15 Bonus' },
+    { kind:'freePlays', amount:10, label:'10 Free Plays' },
+    { kind:'tokens', amount:200, label:'200 Tokens' },
+    { kind:'bonus', amount:500, label:'£5 Bonus' },
+    { kind:'cash', amount:500, label:'£5 Cash' },
+    { kind:'freePlays', amount:5, label:'5 Free Plays' },
+    { kind:'tokens', amount:100, label:'100 Tokens' },
+    { kind:'bonus', amount:1000, label:'£10 Bonus' }
+  ];
+  for(let i=rewardPool.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [rewardPool[i],rewardPool[j]]=[rewardPool[j],rewardPool[i]]; }
+  interface BoxData { idx:number; reward:Reward; kept?:boolean; opened?:boolean; el:HTMLButtonElement; }
+  const boxes: BoxData[] = rewardPool.map((r,i)=>{ const el=document.createElement('button'); el.type='button'; el.textContent=String(i+1); grid.appendChild(el); return { idx:i, reward:r, el }; });
+  let keptBox: BoxData | null = null;
+  let finalContender: BoxData | null = null;
+  let finished = false;
+  function updateStatus(msg:string){ statusEl.innerHTML = `<p>${msg}</p>`; }
+  updateStatus('Select a box to keep.');
+  boxes.forEach(b=>{
+    b.el.addEventListener('click',()=>{
+      if(finished) return;
+      if(!keptBox){ keptBox = b; b.kept=true; b.el.classList.add('kept'); updateStatus('Now open every other box.'); return; }
+      if(b===keptBox || b.opened) return;
+      b.opened=true; b.el.classList.add('eliminated'); b.el.textContent = b.reward.label; b.el.classList.add('opened');
+      const remaining = boxes.filter(x=> !x.opened && x!==keptBox);
+      if(remaining.length===1){
+        finalContender = remaining[0];
+        finalContender.el.classList.add('final'); keptBox!.el.classList.add('final');
+        updateStatus('Final decision: Keep your box or Switch?');
+        decisionsRow.style.display='flex';
+        keepBtn.disabled=false; switchBtn.disabled=false; keepBtn.focus();
+      }
+    });
+  });
+  function conclude(playerBox: BoxData, otherBox: BoxData){
+    if(finished) return; finished = true;
+    applyReward(playerBox.reward);
+    playerBox.el.textContent = playerBox.reward.label + ' (Won)';
+    otherBox.el.textContent = 'Nothing'; otherBox.el.classList.add('eliminated');
+    // Outline handling: ensure only winning (kept) box shows kept outline
+    boxes.forEach(b=> b.el.classList.remove('kept'));
+    playerBox.el.classList.add('kept');
+    otherBox.el.classList.remove('kept');
+    updateStatus(`<strong>You won ${playerBox.reward.label}!</strong>`);
+    decisionsRow.style.display='none';
+    closeRow.style.display='flex';
+    closeBtnBottom.focus();
+  }
+  keepBtn.addEventListener('click',()=>{ if(!keptBox || !finalContender) return; conclude(keptBox, finalContender); });
+  switchBtn.addEventListener('click',()=>{ if(!keptBox || !finalContender) return; conclude(finalContender, keptBox); });
+  backdrop.appendChild(modal); document.body.appendChild(backdrop); document.body.classList.add('modal-open');
+}
+
 
 function maybeApplyTutorialReward(triggerPhase: 'post_move' | 'post_minigame'){
   if(!isTutorialActive(dayState.day)) return;
@@ -2503,7 +2742,7 @@ function applyTutorialReward(plan:TutorialDayPlan){
       break;
     }
     case 'freePlays': if(r.amount){ addFreePlays(r.amount); } break;
-    case 'streak_boost': if(r.amount){ streakState.streak += r.amount; saveStreakState(); updateStreakUI(); } break;
+  case 'streak_boost': if(r.amount){ addPrizeStars(Math.min(5, r.amount)); } break;
     case 'nothing': default: break;
     case 'minigame': break; // minigame opened separately
   }

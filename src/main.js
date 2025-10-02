@@ -1,13 +1,16 @@
 import { Application, Container, Graphics, Text, TextStyle, Circle, Sprite, Assets } from 'pixi.js';
+import { isTutorialActive, getTutorialPlanForDay } from './tutorialPlan';
 import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
+import carnivalBackgroundUrl from '../assets/carnival/carnival_background.png';
 import tokenIconUrl from '../assets/general/token.svg';
+import carnivalCharacterUrl from '../assets/carnival/carnival_character.png';
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards
  - Only ~8 levels visible via camera window height
  - Top area fades out (handled with DOM/CSS gradient overlay added separately)
  - Randomized slight jitter for organic feel
 */
-const LEVEL_COUNT = 30;
+let LEVEL_COUNT = 30; // becomes 100 after tutorial ends
 const STORAGE_KEY = 'trailProgressV2';
 const TOKEN_STORAGE_KEY = 'tokensV1';
 const VISIBLE_LEVEL_WINDOW = 8; // we want: current + 7 ahead visible
@@ -16,10 +19,54 @@ let TOP_VISIBLE_PADDING = 140;
 let BOTTOM_VISIBLE_PADDING = 260; // includes dice bar clearance
 // Dynamic tile radius (updated on viewport compute) so tiles scale slightly on small screens but capped on large.
 let TILE_RADIUS = 38; // default; recomputed each resize
-const MINIGAMES = ['stop_bar', 'coin_flip', 'rps', 'memory_flip', 'slot', 'spin_wheel'];
+// ---------------- Zones ----------------
+// Zone 1: Jungle (levels 1-14) | Zone 2: Carnival (levels 15-30)
+const ZONE_BOUNDARY_LEVEL = 15; // entering this level begins Carnival zone
+const ZONES = [
+    { id: 'Jungle', startLevel: 1 },
+    { id: 'Carnival', startLevel: ZONE_BOUNDARY_LEVEL }
+];
+let currentZoneId = 'Jungle'; // Forced to 'Carnival' during tutorial days (1-8)
+const MINIGAMES = ['slot', 'spin_wheel', 'lootbox'];
 const MINIGAME_ASSIGN_KEY = 'minigameAssignmentsV1';
 const CURRENCY_KEY = 'currenciesV1';
 const CATEGORY_ASSIGN_KEY = 'categoryAssignmentsV1';
+const DAY_STATE_KEY = 'dayStateV1';
+const STREAK_STATE_KEY = 'streakStateV1'; // legacy key retained for migration
+const LEVEL_STATE_KEY = 'levelStateV1';
+let dayState = { day: 1, rollUsed: false };
+function loadDayState() {
+    try {
+        const raw = localStorage.getItem(DAY_STATE_KEY);
+        if (!raw)
+            return;
+        const data = JSON.parse(raw);
+        if (typeof data.day === 'number' && data.day >= 1 && typeof data.rollUsed === 'boolean') {
+            dayState.day = Math.floor(data.day);
+            dayState.rollUsed = data.rollUsed;
+        }
+    }
+    catch { }
+}
+function saveDayState() { localStorage.setItem(DAY_STATE_KEY, JSON.stringify(dayState)); }
+let levelState = { level: 1 };
+function loadLevelState() {
+    try {
+        // Migrate legacy streak to level 1 if no level saved yet
+        const raw = localStorage.getItem(LEVEL_STATE_KEY);
+        if (raw) {
+            const data = JSON.parse(raw);
+            if (typeof data.level === 'number' && data.level >= 1) {
+                levelState.level = Math.floor(data.level);
+            }
+        }
+        else {
+            // If old streak existed, we could map it loosely (e.g., every 5 streaks = 1 level). For now just start at 1.
+        }
+    }
+    catch { }
+}
+function saveLevelState() { localStorage.setItem(LEVEL_STATE_KEY, JSON.stringify(levelState)); }
 // Category assignments (supersede classic minigame-only approach)
 let categoryAssignments = [];
 function loadCategoryAssignments() {
@@ -30,6 +77,24 @@ function loadCategoryAssignments() {
         const arr = JSON.parse(raw);
         if (Array.isArray(arr)) {
             categoryAssignments = arr.filter(a => typeof a.level === 'number' && a.level >= 1 && a.level <= LEVEL_COUNT && typeof a.category === 'string');
+            // Ensure tileId backfilled
+            categoryAssignments.forEach(a => { if (!a.tileId)
+                a.tileId = `tile_${a.level}`; });
+            // Migration: remove direct movement tiles (extra_move/travel_back) so they only appear via mystery resolution
+            let migrated = false;
+            categoryAssignments.forEach(a => {
+                if ((a.category === 'extra_move' || a.category === 'travel_back')) {
+                    // Convert to unresolved mystery tile unless already completed; keep completion state if it was completed
+                    a.resolvedAs = undefined;
+                    a.category = 'mystery';
+                    migrated = true;
+                }
+            });
+            if (migrated)
+                saveCategoryAssignments();
+            if (categoryAssignments.length === 0) {
+                return false; // force regeneration
+            }
             return true;
         }
     }
@@ -46,32 +111,33 @@ function generateCategoryAssignments() {
     // Choose minigame levels (excluding level 1)
     const mgLevels = shuffle(levels.slice(1)).slice(0, MINIGAMES.length);
     const used = new Set(mgLevels);
-    const assignments = mgLevels.map((lvl, i) => ({ level: lvl, category: 'minigame', minigame: MINIGAMES[i], completed: false }));
-    // Mandatory categories ensure coverage
-    const mandatory = ['instant_tokens', 'instant_prize', 'reveal', 'bonus_round', 'mystery', 'extra_move', 'travel_back'];
+    const assignments = mgLevels.map((lvl, i) => ({ level: lvl, category: 'minigame', minigame: MINIGAMES[i], completed: false, tileId: `tile_${lvl}` }));
+    // Mandatory categories ensure coverage (movement tiles removed from direct pool; only appear via mystery resolution)
+    const mandatory = ['instant_tokens', 'instant_prize', 'reveal', 'bonus_round', 'mystery'];
     const remain = shuffle(levels.slice(1).filter(l => !used.has(l))); // keep level 1 separate
     mandatory.forEach((cat, i) => { if (remain[i] !== undefined) {
-        assignments.push({ level: remain[i], category: cat });
-        used.add(remain[i]);
+        const lvl = remain[i];
+        assignments.push({ level: lvl, category: cat, tileId: `tile_${lvl}` });
+        used.add(lvl);
     } });
     // Level 1 always a simple instant token tile
-    assignments.push({ level: 1, category: 'instant_tokens', completed: false });
+    assignments.push({ level: 1, category: 'instant_tokens', completed: false, tileId: 'tile_1' });
     used.add(1);
-    // Fill gaps
-    const fillPool = ['instant_tokens', 'instant_prize', 'reveal', 'mystery', 'extra_move', 'travel_back', 'minigame'];
+    // Fill gaps (movement categories removed from direct generation)
+    const fillPool = ['instant_tokens', 'instant_prize', 'reveal', 'mystery', 'minigame'];
     levels.forEach(l => {
         if (!used.has(l)) {
             const cat = fillPool[Math.floor(Math.random() * fillPool.length)];
             if (cat === 'minigame') {
                 const unused = MINIGAMES.filter(m => !assignments.some(a => a.minigame === m));
                 if (unused.length) {
-                    assignments.push({ level: l, category: 'minigame', minigame: unused[0], completed: false });
+                    assignments.push({ level: l, category: 'minigame', minigame: unused[0], completed: false, tileId: `tile_${l}` });
                 }
                 else
-                    assignments.push({ level: l, category: 'instant_tokens', completed: false });
+                    assignments.push({ level: l, category: 'instant_tokens', completed: false, tileId: `tile_${l}` });
             }
             else
-                assignments.push({ level: l, category: cat });
+                assignments.push({ level: l, category: cat, tileId: `tile_${l}` });
         }
     });
     categoryAssignments = assignments.sort((a, b) => a.level - b.level);
@@ -80,12 +146,34 @@ function generateCategoryAssignments() {
 function ensureCategoryAssignments() { if (!loadCategoryAssignments())
     generateCategoryAssignments(); }
 function getCategoryAssignment(level) { return categoryAssignments.find(a => a.level === level); }
+function getCategoryAssignmentByTileId(tileId) { return categoryAssignments.find(a => a.tileId === tileId); }
+// Expose developer helper to force a specific reward on an instant_prize tile
+window.forceTileReward = function (tileId, reward) {
+    const assign = getCategoryAssignmentByTileId(tileId);
+    if (!assign) {
+        console.warn('Tile not found for id', tileId);
+        return;
+    }
+    if (assign.category !== 'instant_prize') {
+        console.warn('Tile is not an instant_prize category; current:', assign.category);
+    }
+    assign.forcedReward = reward;
+    saveCategoryAssignments();
+    console.log('Forced reward set on', tileId, reward);
+};
+// One-off landing category override for next landing only (debug)
+let nextLandingCategoryOverride = null;
+window.overrideLandingCategoryOnce = function (cat) {
+    nextLandingCategoryOverride = cat;
+    console.log('Next landing category will be forced to', cat);
+};
 // Reward catalogue
 const REWARDS = [
     { kind: 'freePlays', amount: 1, label: '1 Free Play' },
     { kind: 'freePlays', amount: 5, label: '5 Free Plays' },
     { kind: 'cash', amount: 10, label: '10p Cash' },
     { kind: 'cash', amount: 100, label: '£1 Cash' },
+    { kind: 'bonus', amount: 50, label: '50p Bonus Money' },
     { kind: 'bonus', amount: 100, label: '£1 Bonus Money' },
     { kind: 'bonus', amount: 500, label: '£5 Bonus Money' },
     { kind: 'tokens', amount: 10, label: '10 Tokens' },
@@ -97,6 +185,8 @@ const REWARDS = [
 let freePlays = 0; // integer count
 let cashPence = 0; // store pence (100 == £1)
 let bonusPence = 0; // bonus money in pence
+let streakKeys = 0; // new currency type
+let prizeStars = 0; // new currency type
 function loadCurrencies() {
     try {
         const raw = localStorage.getItem(CURRENCY_KEY);
@@ -109,11 +199,15 @@ function loadCurrencies() {
             cashPence = data.cashPence;
         if (typeof data.bonusPence === 'number')
             bonusPence = data.bonusPence;
+        if (typeof data.streakKeys === 'number')
+            streakKeys = data.streakKeys;
+        if (typeof data.prizeStars === 'number')
+            prizeStars = data.prizeStars;
     }
     catch { }
 }
 function saveCurrencies() {
-    localStorage.setItem(CURRENCY_KEY, JSON.stringify({ freePlays, cashPence, bonusPence }));
+    localStorage.setItem(CURRENCY_KEY, JSON.stringify({ freePlays, cashPence, bonusPence, streakKeys, prizeStars }));
 }
 function addFreePlays(n) { if (n > 0) {
     freePlays += n;
@@ -130,16 +224,37 @@ function addBonusPence(n) { if (n > 0) {
     saveCurrencies();
     updateCurrencyCounters();
 } }
+function addStreakKeys(n) { if (n > 0) {
+    streakKeys += n;
+    saveCurrencies();
+    updateCurrencyCounters();
+} }
+function addPrizeStars(n) { if (n > 0) {
+    prizeStars += n;
+    saveCurrencies();
+    updateCurrencyCounters();
+} }
 // Minigame assignments
 let minigameAssignments = [];
 function loadMinigameAssignments() {
+    ensureResetFab();
     try {
         const raw = localStorage.getItem(MINIGAME_ASSIGN_KEY);
         if (!raw)
             return false;
         const arr = JSON.parse(raw);
         if (Array.isArray(arr)) {
-            minigameAssignments = arr.filter(a => MINIGAMES.includes(a.game) && typeof a.level === 'number');
+            const filtered = arr.filter(a => a && typeof a.level === 'number' && MINIGAMES.includes(a.game));
+            const removed = arr.length - filtered.length;
+            // If after filtering we don't have a full set for current roster, regenerate fresh to spread them out
+            if (filtered.length < MINIGAMES.length) {
+                generateMinigameAssignments();
+                return true;
+            }
+            minigameAssignments = filtered;
+            // Persist sanitized list if anything was removed
+            if (removed > 0)
+                saveMinigameAssignments();
             return true;
         }
     }
@@ -163,7 +278,14 @@ function ensureMinigameAssignments() { if (!loadMinigameAssignments())
     generateMinigameAssignments(); }
 function formatCash(pence) { if (pence < 100)
     return pence + 'p'; const pounds = (pence / 100).toFixed(pence % 100 === 0 ? 0 : 2); return '£' + pounds; }
-function selectReward() { return REWARDS[Math.floor(Math.random() * REWARDS.length)]; }
+function selectReward() {
+    // During tutorial days, suppress 'nothing' outcomes to keep early experience rewarding
+    if (isTutorialActive(dayState.day)) {
+        const filtered = REWARDS.filter(r => r.kind !== 'nothing');
+        return filtered[Math.floor(Math.random() * filtered.length)];
+    }
+    return REWARDS[Math.floor(Math.random() * REWARDS.length)];
+}
 function applyReward(r) {
     if (r.kind === 'tokens' && r.amount)
         addTokens(r.amount);
@@ -173,7 +295,15 @@ function applyReward(r) {
         addCashPence(r.amount);
     else if (r.kind === 'bonus' && r.amount)
         addBonusPence(r.amount);
+    else if (r.kind === 'streakKeys' && r.amount)
+        addStreakKeys(r.amount);
+    else if (r.kind === 'prizeStars' && r.amount)
+        addPrizeStars(r.amount);
     updateCurrencyCounters();
+}
+// Helper to format appended meta reward line
+function formatMetaBonusLine() {
+    return `<p class='meta-bonus-line' style="margin-top:10px;font-size:13px;opacity:.85;"><strong>+1 🔑 Streak Key</strong> & <strong>+1 ⭐ Prize Star</strong></p>`;
 }
 // Declare node/connector storage early so buildTrail can populate them
 const levelNodes = [];
@@ -192,6 +322,8 @@ catch {
 } }
 function saveProgress(state) { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
 const progress = loadProgress();
+// Track whether a multi-step movement animation (advance or retreat) is currently playing so we can delay UI like Next Day button
+let movementInProgress = false;
 // ---------------------------------------------------------------------------------
 // Full manual layout (one entry per level) for horizontal meander & small vertical nudges.
 // x: relative horizontal offset from center; yOffset: adds/subtracts pixels to the base vertical step for local variety.
@@ -291,17 +423,29 @@ catch {
 } }
 function saveTokens() { localStorage.setItem(TOKEN_STORAGE_KEY, String(tokens)); }
 // (removed duplicate updateTokenCounter definition - consolidated earlier)
-function addTokens(n) { if (n > 0) {
-    tokens += n;
-    saveTokens();
-    updateTokenCounter();
-} }
+// Dual-choice milestone flags
+let tokenDualPopupReady = false; // becomes true once threshold crossed
+let tokenDualPopupConsumed = false; // set true once popup opened & tokens deducted
+function addTokens(n) {
+    if (n > 0) {
+        const prev = tokens;
+        tokens += n;
+        saveTokens();
+        updateTokenCounter();
+        if (!tokenDualPopupConsumed && prev < 120 && tokens >= 120) {
+            tokenDualPopupReady = true; // will be shown end-of-day
+        }
+    }
+}
 tokens = loadTokens();
 let positions = generateVerticalPositions(LEVEL_COUNT);
 let height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
 const app = new Application();
-// Background layer (will parallax scroll vertically with world; stays decoupled horizontally)
-const backgroundLayer = new Container(); // jungle tiles (now locked to world movement: no parallax)
+// Background layers (each zone gets its own tiled container for cross-fade)
+const backgroundLayer = new Container(); // parent
+const jungleLayer = new Container();
+const carnivalLayer = new Container();
+backgroundLayer.addChild(jungleLayer, carnivalLayer);
 const world = new Container(); // moves with camera
 const trailLayer = new Container();
 const levelLayer = new Container();
@@ -311,6 +455,8 @@ app.stage.addChild(backgroundLayer);
 app.stage.addChild(world);
 async function initApp() {
     loadCurrencies();
+    loadDayState();
+    loadLevelState();
     ensureCategoryAssignments(); // new category system (includes embedded minigames)
     await app.init({ backgroundAlpha: 0, antialias: true, width: viewWidth, height: viewHeight, autoDensity: true });
     const rootEl = document.getElementById('pixi-root');
@@ -355,40 +501,53 @@ function buildTrail() {
 }
 // --- Jungle background tiling ---
 let jungleTexture = null;
-let jungleTileHeight = 0; // cache for parallax bounds
+let carnivalTexture = null;
+let jungleTileHeight = 0;
+let carnivalTileHeight = 0;
 async function buildBackground() {
-    backgroundLayer.removeChildren();
+    jungleLayer.removeChildren();
+    carnivalLayer.removeChildren();
     if (!jungleTexture) {
         try {
             jungleTexture = await Assets.load(jungleBackgroundUrl);
-            console.info('[background] Loaded jungle texture (import)', jungleBackgroundUrl);
         }
         catch (e) {
-            console.warn('[background] Failed to load imported jungle texture:', jungleBackgroundUrl, e);
-            return;
+            console.warn('Failed to load jungle', e);
         }
     }
-    if (!jungleTexture)
-        return;
-    // Cover scaling: stretch width to full view width + small overdraw, then scale height proportionally with multiplier.
-    const OVERDRAW_X = 100; // horizontal extra so edges never show when rounding
-    const HEIGHT_MULT = 1.28; // stretch vertically to reduce visible repetition & align with fade
-    const tileW = viewWidth + OVERDRAW_X;
-    const scale = tileW / jungleTexture.width;
-    const tileH = Math.round(jungleTexture.height * scale * HEIGHT_MULT);
-    if (tileH <= 0)
-        return;
-    jungleTileHeight = tileH;
-    const totalH = height + viewHeight + tileH;
-    for (let y = 0; y < totalH; y += tileH) {
-        const s = new Sprite(jungleTexture);
-        s.x = -(OVERDRAW_X / 2);
-        s.y = y;
-        s.width = tileW;
-        s.height = tileH;
-        s.alpha = 1;
-        backgroundLayer.addChild(s);
+    if (!carnivalTexture) {
+        try {
+            carnivalTexture = await Assets.load(carnivalBackgroundUrl);
+        }
+        catch (e) {
+            console.warn('Failed to load carnival', e);
+        }
     }
+    const OVERDRAW_X = 100;
+    const HEIGHT_MULT = 1.28;
+    const tileW = viewWidth + OVERDRAW_X;
+    function tileLayer(tex, layer, storeHeight) {
+        if (!tex)
+            return;
+        const scale = tileW / tex.width;
+        const tileH = Math.round(tex.height * scale * HEIGHT_MULT);
+        if (tileH <= 0)
+            return;
+        storeHeight(tileH);
+        const totalH = height + viewHeight + tileH;
+        for (let y = 0; y < totalH; y += tileH) {
+            const s = new Sprite(tex);
+            s.x = -(OVERDRAW_X / 2);
+            s.y = y;
+            s.width = tileW;
+            s.height = tileH;
+            s.alpha = 1;
+            layer.addChild(s);
+        }
+    }
+    tileLayer(jungleTexture, jungleLayer, h => jungleTileHeight = h);
+    tileLayer(carnivalTexture, carnivalLayer, h => carnivalTileHeight = h);
+    updateZoneCrossfade();
 }
 function drawConnector(g, fromLevel, toLevel) {
     g.clear();
@@ -434,12 +593,10 @@ function createLevels() {
         container.cursor = 'pointer';
         const g = new Graphics();
         const catAssign = getCategoryAssignment(levelNumber);
-        if (catAssign) { // placeholder: reuse circle until category shapes added
+        if (catAssign)
+            drawCategoryShape(g, catAssign);
+        else
             drawCircleForState(g, computeState(levelNumber));
-        }
-        else {
-            drawCircleForState(g, computeState(levelNumber));
-        }
         const label = new Text({ text: String(levelNumber), style: levelLabelStyle });
         label.anchor.set(0.5);
         label.y = 2;
@@ -482,17 +639,37 @@ function positionPlayer(level, instant = false, duration = 600) {
     }
     tween(playerToken, { x: targetX, y: targetY }, duration, easeInOutCubic);
 }
+// ---------------- Zone Crossfade Logic ----------------
+function levelToY(level) { return positions[level - 1]?.y ?? 0; }
+// Determine a vertical boundary Y using boundary level position; crossfade across a vertical band
+function getZoneBoundaryY() { return levelToY(ZONE_BOUNDARY_LEVEL); }
+// Size of blend band in pixels (above & below boundary center)
+const ZONE_BLEND_HALF = 400; // tune for smoother / longer transition
+function updateZoneCrossfade() {
+    // Compute midpoint of viewport (world space)
+    const viewportMidYWorld = -world.position.y + viewHeight / 2;
+    const boundaryY = getZoneBoundaryY();
+    const dy = viewportMidYWorld - boundaryY; // negative means below boundary (earlier levels)
+    // Map dy into 0..1 fade: when dy <= -ZONE_BLEND_HALF => jungle=1; when dy >= ZONE_BLEND_HALF => carnival=1
+    const t = clamp((dy + ZONE_BLEND_HALF) / (ZONE_BLEND_HALF * 2), 0, 1);
+    jungleLayer.alpha = 1 - t;
+    carnivalLayer.alpha = t;
+    if (isTutorialActive(dayState.day))
+        currentZoneId = 'Carnival';
+    else
+        currentZoneId = t < 0.5 ? 'Jungle' : 'Carnival';
+}
 function drawCircleForState(g, state) {
     g.clear();
-    // Color scheme update:
-    // completed -> green, current -> accent orange, unlocked -> neutral (light gray), locked -> darker gray
+    // Fallback (should rarely render because all tiles have categories). We no longer color passed tiles green;
+    // only explicit category completion will render green via drawCategoryShape.
     let fill = 0x3d444c; // locked base
-    if (state === 'completed')
-        fill = 0x4caf50; // green for completed
-    else if (state === 'current')
-        fill = 0xff9f43; // accent
+    if (state === 'current')
+        fill = 0xff9f43; // accent for current
     else if (state === 'unlocked')
-        fill = 0x5a6470; // neutral mid tone (no green highlight)
+        fill = 0x5a6470; // upcoming next tile
+    else if (state === 'completed')
+        fill = 0x46525d; // previously passed but unresolved (neutral, not green)
     g.lineStyle(4, 0x182028, 1);
     g.beginFill(fill);
     g.drawCircle(0, 0, TILE_RADIUS);
@@ -501,15 +678,15 @@ function drawCircleForState(g, state) {
 function drawCategoryShape(g, assign) {
     g.clear();
     const state = computeState(assign.level);
-    let fill = 0x3d444c;
+    let fill = 0x3d444c; // default locked / future
     if (assign.completed)
-        fill = 0x4caf50;
-    else if (state === 'completed')
-        fill = 0x4caf50;
+        fill = 0x4caf50; // only true category completion is green
     else if (state === 'current')
-        fill = 0xff9f43;
+        fill = 0xff9f43; // current tile
     else if (state === 'unlocked')
-        fill = 0x5a6470;
+        fill = 0x5a6470; // immediate next tile
+    else if (state === 'completed')
+        fill = 0x46525d; // passed but not resolved (neutral)
     g.lineStyle(4, 0x182028, 1);
     g.beginFill(fill);
     const r = TILE_RADIUS;
@@ -617,8 +794,9 @@ function triggerCategoryInteraction(level, manual, depth = 0) {
         refreshStates();
     }
     const eff = assign.category === 'mystery' && assign.resolvedAs ? assign.resolvedAs : assign.category;
+    // (Bonus round deferral now handled generically at landing sequence in advanceBy when post_move tutorial opens)
     if (eff === 'minigame') {
-        if (!assign.minigame) {
+        if (!assign.minigame || !MINIGAMES.includes(assign.minigame)) {
             assign.minigame = MINIGAMES[Math.floor(Math.random() * MINIGAMES.length)];
             saveCategoryAssignments();
         }
@@ -665,7 +843,8 @@ function completeLevel(level) {
     if (progress.current < LEVEL_COUNT) {
         progress.current += 1;
         saveProgress(progress);
-        addTokens(1); // award token per completed level
+        // Award 1 token per forward step landed on
+        addTokens(1);
         refreshStates();
         positionPlayer(progress.current);
         centerCameraOnLevel(progress.current);
@@ -680,8 +859,17 @@ function advanceBy(steps) {
     const remaining = Math.min(steps, LEVEL_COUNT - progress.current);
     if (remaining <= 0)
         return;
+    movementInProgress = true;
+    // Tutorial clamp to targetLevel if defined
+    const plan = getTutorialPlanForDay(dayState.day);
+    let effective = remaining;
+    if (plan && plan.targetLevel > 0) {
+        const allowed = plan.targetLevel - progress.current;
+        if (allowed < effective)
+            effective = Math.max(0, allowed);
+    }
     const sequence = [];
-    for (let i = 0; i < remaining; i++)
+    for (let i = 0; i < effective; i++)
         sequence.push(progress.current + 1 + i);
     const stepDuration = 520; // ms per hop (camera tween 600 so shorten move tween)
     function hop() {
@@ -689,7 +877,8 @@ function advanceBy(steps) {
             return;
         progress.current += 1;
         saveProgress(progress);
-        addTokens(1); // award per hop
+        // Award 1 token per hop
+        addTokens(1);
         refreshStates();
         positionPlayer(progress.current, false, stepDuration - 50);
         centerCameraOnLevel(progress.current);
@@ -700,7 +889,51 @@ function advanceBy(steps) {
         else {
             sequence.shift();
             // Final landing – attempt auto-trigger (minigame etc.)
-            setTimeout(() => { maybeAutoTriggerCategory(); }, stepDuration + 120);
+            setTimeout(() => {
+                // Tutorial category override: mutate landed tile category before reward & popups
+                const planNow = getTutorialPlanForDay(dayState.day);
+                const forcedCat = nextLandingCategoryOverride || (planNow && planNow.forceLandingCategory);
+                if (forcedCat) {
+                    const assign = getCategoryAssignment(progress.current);
+                    if (assign) {
+                        if (assign.category !== forcedCat) {
+                            assign.category = forcedCat;
+                            // Clear resolved/minigame specifics if overwriting
+                            if (assign.category !== 'minigame') {
+                                delete assign.minigame;
+                            }
+                            assign.completed = false; // ensure it's active
+                            saveCategoryAssignments();
+                            refreshStates();
+                        }
+                    }
+                    nextLandingCategoryOverride = null;
+                }
+                maybeApplyTutorialReward('post_move');
+                const openedPostMove = maybeApplyTutorialPopups('post_move');
+                // If we opened a post_move tutorial chain and the landed category is an immediate-resolution category, defer until tutorial closes
+                const assign = getCategoryAssignment(progress.current);
+                if (openedPostMove && assign) {
+                    const effCat = assign.category === 'mystery' && assign.resolvedAs ? assign.resolvedAs : assign.category;
+                    const deferrable = ['bonus_round', 'instant_tokens', 'instant_prize', 'reveal'];
+                    if (deferrable.includes(effCat) && isTutorialActive(dayState.day)) {
+                        // Force full replay of post_move chain even if some pages had been marked shown earlier (safety)
+                        forceReplayPhases.add('post_move');
+                        // Queue the auto trigger to run after tutorial closes (closeModal will process deferredCategoryAction)
+                        if (!deferredCategoryAction) {
+                            deferredCategoryAction = () => { maybeAutoTriggerCategory(); };
+                        }
+                    }
+                    else {
+                        maybeAutoTriggerCategory();
+                    }
+                }
+                else {
+                    maybeAutoTriggerCategory();
+                }
+                // Mark movement complete slightly after auto-trigger begins, then evaluate day completion (so button appears only after landing & triggers)
+                setTimeout(() => { movementInProgress = false; evaluateDayCompletion(); }, 200);
+            }, stepDuration + 120);
         }
     }
     hop();
@@ -713,6 +946,7 @@ function retreatBy(steps) {
     const remaining = Math.min(steps, canRetreat);
     if (remaining <= 0)
         return;
+    movementInProgress = true;
     const sequence = [];
     for (let i = 0; i < remaining; i++)
         sequence.push(progress.current - 1 - i);
@@ -733,6 +967,7 @@ function retreatBy(steps) {
             sequence.shift();
             // Final landing after retreat chain
             setTimeout(() => { maybeAutoTriggerCategory(); }, stepDuration + 120);
+            setTimeout(() => { movementInProgress = false; evaluateDayCompletion(); }, stepDuration + 260);
         }
     }
     hop();
@@ -745,6 +980,9 @@ function maybeAutoTriggerCategory() {
         return; // no category assigned (fallback placeholder)
     if (assign.completed)
         return; // already resolved
+    // Defer if a forced tutorial minigame is queued; minigame should take precedence
+    if (pendingForcedMinigame)
+        return;
     // Close any existing modal before opening a new one (safety)
     closeModal();
     // Use standard interaction pipeline (manual=false)
@@ -786,6 +1024,7 @@ function centerCameraOnLevel(level, instant = false) {
         // Keep background vertically synced, but do NOT move horizontally with camera
         backgroundLayer.y = world.position.y; // vertical lock (no parallax)
         backgroundLayer.x = 0; // horizontal decoupling keeps river centered
+        updateZoneCrossfade();
     };
     if (instant) {
         world.position.set(targetX, targetY);
@@ -806,6 +1045,7 @@ function applyWorldY(y) {
     world.position.y = y;
     // sync background vertical position
     backgroundLayer.y = world.position.y;
+    updateZoneCrossfade();
 }
 function enableFreeScroll(rootEl) {
     // Wheel scroll
@@ -887,13 +1127,27 @@ function renderControls() {
         controls = document.createElement('div');
         controls.className = 'controls';
         controls.innerHTML = `
-      <div class="currency-bar" aria-label="Currencies">
-        <div class="currency token-counter pill"><img src="${tokenIconUrl}" alt="Token" class="token-icon" /><span class="token-count">0</span></div>
-        <div class="currency fp-counter pill" title="Free Plays"><span class="label">FP</span><span class="fp-count">0</span></div>
-        <div class="currency cash-counter pill" title="Cash Balance"><span class="label">💰</span><span class="cash-count">0</span></div>
-        <div class="currency bonus-counter pill" title="Bonus Money"><span class="label">BM</span><span class="bonus-count">0</span></div>
+      <div class="currency-bar vertical" aria-label="Currencies">
+        <div class="currency-meta" aria-label="Meta Progress">
+          <div class="currency day-counter pill" title="Current Day"><span class="label">Day</span><span class="day-count">1</span></div>
+          <div class="currency level-counter pill" title="Player Level"><span class="label">Lvl</span><span class="level-count">1</span></div>
+          <div class="prize-star-progress" title="Prize Star Progress" aria-label="Prize Star Progress">
+            <div class="ps-progress-bar"><div class="ps-progress-fill"></div></div>
+            <div class="ps-progress-label"><span class="ps-progress-count">0</span>/5 ⭐</div>
+          </div>
+        </div>
+        <div class="currency-group-card" aria-label="Reward Currencies">
+          <div class="currency token-counter pill"><img src="${tokenIconUrl}" alt="Token" class="token-icon" /><span class="token-count">0</span></div>
+          <div class="currency fp-counter pill" title="Free Plays"><span class="label">FP</span><span class="fp-count">0</span></div>
+          <div class="currency cash-counter pill" title="Cash Balance"><span class="label">💰</span><span class="cash-count">0</span></div>
+          <div class="currency bonus-counter pill" title="Bonus Money"><span class="label">BM</span><span class="bonus-count">0</span></div>
+          <div class="currency sk-counter pill" title="Streak Keys"><span class="label">🔑</span><span class="sk-count">0</span></div>
+          <div class="currency ps-counter pill" title="Prize Stars"><span class="label">⭐</span><span class="ps-count">0</span></div>
+        </div>
       </div>
-      <button type="button" data-action="reset" class="reset" aria-label="Reset progress">Reset</button>`;
+      <div class="control-row" style="display:flex;gap:8px;margin-top:10px;">
+        <button type="button" data-action="reset" class="reset" aria-label="Reset progress">Reset</button>
+      </div>`;
         document.getElementById('app')?.appendChild(controls);
         // Floating legend button (only once)
         if (!document.querySelector('.legend-fab')) {
@@ -911,30 +1165,123 @@ function renderControls() {
         if (!document.getElementById('currency-pills-style')) {
             const style = document.createElement('style');
             style.id = 'currency-pills-style';
-            style.textContent = `.currency-bar{display:flex;gap:8px;align-items:center;font-weight:600;font-size:13px;}
-        .currency-bar .pill{display:flex;align-items:center;gap:4px;padding:4px 8px;background:rgba(20,24,28,0.6);border:1px solid #2a333c;border-radius:20px;backdrop-filter:blur(4px);} 
+            style.textContent = `.currency-bar{display:flex;gap:12px;align-items:flex-start;font-weight:600;font-size:13px;}
+        .currency-bar.vertical{align-items:flex-start;flex-direction:row;flex-wrap:wrap;}
+        .currency-bar .currency-meta{display:flex;flex-direction:column;gap:6px;padding:10px 12px;background:rgba(32,38,45,0.55);border:1px solid #2a333c;border-radius:18px;backdrop-filter:blur(6px);box-shadow:0 4px 12px rgba(0,0,0,0.35);}
+        .currency-bar.vertical .currency-group-card{display:flex;flex-direction:column;gap:6px;padding:10px 12px;background:rgba(20,24,28,0.55);border:1px solid #2a333c;border-radius:18px;backdrop-filter:blur(6px);box-shadow:0 4px 12px rgba(0,0,0,0.4);}
+        .currency-bar.vertical .pill{background:rgba(255,255,255,0.06);border:1px solid #333;}
+        .currency-bar .pill{display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(20,24,28,0.6);border:1px solid #2a333c;border-radius:18px;backdrop-filter:blur(4px);} 
         .currency-bar .pill .label{opacity:0.85;font-size:12px;letter-spacing:.5px;} 
         .currency-bar .cash-counter .label{font-size:15px;line-height:1;} 
-        .currency-bar img.token-icon{width:18px;height:18px;display:block;}
-        .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
+    .currency-bar img.token-icon{width:18px;height:18px;display:block;}
+    .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
+  .prize-star-progress{position:relative;display:flex;flex-direction:column;padding:6px 8px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:150px;}
+  .ps-progress-bar{position:relative;width:100%;height:24px;background:#1f262d;border:1px solid #36424d;border-radius:10px;overflow:hidden;display:flex;align-items:center;}
+  .ps-progress-fill{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.6) inset,0 0 4px rgba(255,159,67,0.55);transition:width .6s cubic-bezier(.4,.8,.2,1),filter .5s;}
+  /* Adjust vertical nudge of label here via translateY */
+  .ps-progress-label{pointer-events:none;position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;letter-spacing:.6px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.9),0 0 4px rgba(0,0,0,0.55);transform:translateY(-1px);} 
+  .prize-star-progress .ps-progress-label .ps-progress-count{margin-right:4px;}
+  .prize-star-progress.compact{padding:4px 6px 6px;}
+  .ps-progress-complete .ps-progress-label{color:#222;}
+  .ps-progress-complete .ps-progress-fill{filter:drop-shadow(0 0 6px #ff9f43) drop-shadow(0 0 12px rgba(255,159,67,.75));animation:psPulse 1.6s ease-in-out infinite alternate;}
+  @keyframes psPulse{0%{opacity:1;}100%{opacity:.6;}}
+        .controls button.next-day{background:#304050;color:#fff;border:1px solid #456075;padding:8px 14px;font-weight:600;border-radius:10px;cursor:pointer;transition:background .25s,box-shadow .25s;}
+        .controls button.next-day:disabled{opacity:.35;cursor:default;box-shadow:none;}
+        .controls button.next-day.ready{box-shadow:0 0 0 2px #ff9f43 inset,0 0 10px 2px rgba(255,159,67,0.55);}
+        .controls button.reset{background:#402c2c;color:#fff;border:1px solid #664242;padding:8px 14px;font-weight:600;border-radius:10px;cursor:pointer;}
+        .dice-bar .dice-btn.daily-used{background:#3a3f44 !important;border:0;color:#888;box-shadow:inset 0 0 0 2px #555;position:relative;}
+        .dice-bar .dice-btn.daily-used::after{content:'Daily used';position:absolute;bottom:-18px;left:50%;transform:translateX(-50%);font-size:10px;font-weight:600;color:#bbb;letter-spacing:.5px;}
+        @keyframes diceGlow{0%,100%{box-shadow:0 0 0 4px rgba(255,159,67,0.25),0 0 18px 4px rgba(255,159,67,0.55);}50%{box-shadow:0 0 0 2px rgba(255,159,67,0.55),0 0 10px 2px rgba(255,159,67,0.9);}}
+        @keyframes diceShake{0%,100%{transform:translateY(-3px) rotateZ(-3deg);}25%{transform:translate(-3px,1px) rotateZ(5deg);}50%{transform:translate(3px,-2px) rotateZ(-6deg);}75%{transform:translate(-2px,2px) rotateZ(4deg);}}
+        .dice-cube.can-roll{animation:diceGlow 2.8s ease-in-out infinite;position:relative;}
+        .dice-cube.can-roll::after{content:'Roll!';position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:11px;font-weight:600;color:#ffcf9a;letter-spacing:.5px;text-shadow:0 1px 2px #000;}
+        .dice-cube.spinning{animation:diceShake 0.65s linear infinite;}
       `;
             document.head.appendChild(style);
         }
     }
-    controls.querySelector('[data-action="reset"]')?.addEventListener('click', () => {
-        if (confirm('Reset your progress?')) {
-            progress.current = 1;
-            saveProgress(progress);
-            refreshStates();
-            positionPlayer(progress.current, true);
-            centerCameraOnLevel(progress.current, true);
-        }
-    });
+    // Legacy inline reset button removed; ensure floating fab is present
+    ensureResetFab();
+    // next-day button now injected dynamically in place of dice when day complete
     updateResetButton();
     updateTokenCounter();
+    updateDayUI();
 }
 function updateResetButton() { const btn = document.querySelector('[data-action="reset"]'); if (btn)
     btn.disabled = progress.current === 1; }
+// Centralized full reset routine (used by inline button & floating reset-fab)
+function performFullReset() {
+    closeModal();
+    progress.current = 1;
+    saveProgress(progress);
+    categoryAssignments.forEach(a => { a.completed = false; if (a.category === 'mystery') {
+        delete a.resolvedAs;
+    } });
+    saveCategoryAssignments();
+    minigameAssignments.forEach(m => { m.completed = false; });
+    saveMinigameAssignments();
+    tokens = 0;
+    saveTokens();
+    freePlays = 0;
+    cashPence = 0;
+    bonusPence = 0;
+    streakKeys = 0;
+    prizeStars = 0;
+    saveCurrencies();
+    updateCurrencyCounters();
+    dayState.day = 1;
+    dayState.rollUsed = false;
+    saveDayState();
+    updateDayUI();
+    levelState.level = 1;
+    saveLevelState();
+    updateLevelUI();
+    document.querySelectorAll('.inline-next-day-btn').forEach(el => el.remove());
+    const diceBtn = document.querySelector('.dice-roll-btn');
+    if (diceBtn) {
+        diceBtn.style.display = '';
+        diceBtn.disabled = false;
+        diceBtn.classList.remove('daily-used');
+        diceBtn.classList.add('can-roll');
+    }
+    if (typeof prizeStarJackpotPlayedToday !== 'undefined')
+        prizeStarJackpotPlayedToday = false;
+    dayMinigameCompleted = false;
+    LEVEL_COUNT = 30;
+    generateMinigameAssignments();
+    generateCategoryAssignments();
+    refreshStates();
+    positionPlayer(progress.current, true);
+    centerCameraOnLevel(progress.current, true);
+    trailLayer.removeChildren();
+    levelLayer.removeChildren();
+    connectors.splice(0, connectors.length);
+    levelNodes.splice(0, levelNodes.length);
+    positions = generateVerticalPositions(LEVEL_COUNT);
+    height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
+    app.renderer.resize(viewWidth, viewHeight);
+    buildTrail();
+    createLevels();
+    refreshStates();
+    positionPlayer(progress.current, true);
+    setTimeout(() => maybeApplyTutorialPopups('start_day'), 400);
+    updateResetButton();
+}
+function ensureResetFab() {
+    let btn = document.querySelector('.reset-fab');
+    if (!btn) {
+        btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'reset-fab';
+        btn.innerHTML = '<span class="rf-icon" style="font-size:14px;line-height:1;">↺</span><span class="rf-label" style="margin-left:6px;">Reset</span>';
+        btn.title = 'Reset progress';
+        btn.ariaLabel = 'Reset progress';
+        document.body.appendChild(btn);
+        btn.addEventListener('click', () => { if (confirm('Reset your progress?'))
+            performFullReset(); });
+    }
+    return btn;
+}
 function updateTokenCounter() { const span = document.querySelector('.token-counter .token-count'); if (span)
     span.textContent = String(tokens); }
 function updateCurrencyCounters() {
@@ -948,6 +1295,57 @@ function updateCurrencyCounters() {
     const bonus = document.querySelector('.bonus-count');
     if (bonus)
         bonus.textContent = formatCash(bonusPence);
+    const sk = document.querySelector('.sk-count');
+    if (sk)
+        sk.textContent = String(streakKeys);
+    const ps = document.querySelector('.ps-count');
+    if (ps)
+        ps.textContent = String(prizeStars);
+    updatePrizeStarProgress();
+    updateLevelUI();
+}
+function updatePrizeStarProgress() {
+    const wrap = document.querySelector('.prize-star-progress');
+    if (!wrap)
+        return;
+    const fill = wrap.querySelector('.ps-progress-fill');
+    const count = wrap.querySelector('.ps-progress-count');
+    if (count)
+        count.textContent = String(Math.min(5, prizeStars));
+    if (fill) {
+        const pct = Math.min(1, prizeStars / 5);
+        fill.style.width = (pct * 100) + '%';
+        if (pct >= 1)
+            wrap.classList.add('ps-progress-complete');
+        else
+            wrap.classList.remove('ps-progress-complete');
+    }
+}
+function updateDayUI() {
+    const daySpan = document.querySelector('.day-count');
+    if (daySpan)
+        daySpan.textContent = String(dayState.day);
+    updateLevelUI();
+    const rollBtn = document.querySelector('.dice-roll-btn');
+    if (rollBtn) {
+        if (dayState.rollUsed) {
+            rollBtn.classList.add('daily-used');
+            rollBtn.classList.remove('can-roll');
+            rollBtn.disabled = true; // ensure disabled attribute
+        }
+        else {
+            rollBtn.classList.remove('daily-used');
+            rollBtn.classList.add('can-roll');
+            if (!isRolling)
+                rollBtn.disabled = false;
+        }
+    }
+    // Dynamic next-day button state handled by evaluateDayCompletion
+}
+function updateLevelUI() {
+    const levelSpan = document.querySelector('.level-count');
+    if (levelSpan)
+        levelSpan.textContent = String(levelState.level);
 }
 function openModal(level) {
     closeModal();
@@ -957,7 +1355,6 @@ function openModal(level) {
     modal.className = 'modal';
     modal.setAttribute('role', 'dialog');
     modal.innerHTML = `
-    <button class="close-btn" aria-label="Close">×</button>
     <h2>Level ${level}</h2>
     <p>Placeholder content for level ${level}. Complete to advance.</p>
     <div class="modal-footer">
@@ -966,14 +1363,173 @@ function openModal(level) {
     </div>`;
     backdrop.addEventListener('click', e => { if (e.target === backdrop)
         closeModal(); });
-    modal.querySelector('.close-btn')?.addEventListener('click', closeModal);
     modal.querySelector('[data-action="cancel"]')?.addEventListener('click', closeModal);
     modal.querySelector('[data-action="complete"]')?.addEventListener('click', () => { completeLevel(level); closeModal(); });
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
     setTimeout(() => modal.querySelector('[data-action="complete"]')?.focus(), 30);
 }
-function closeModal() { document.querySelector('.modal-backdrop')?.remove(); }
+let pendingPostMinigamePhase = false;
+let pendingPostInstantWinPhase = false; // track tutorial follow-up after instant reward (non-minigame)
+let pendingPostBonusRoundPhase = false; // follow-up after bonus round category
+let pendingMetaTrail = false; // set when we should animate key/star travel after modal closes
+// Deferred category interaction (used to delay Day 3 bonus round until after post_move tutorial closes)
+let deferredCategoryAction = null;
+function closeModal() {
+    document.querySelector('.modal-backdrop')?.remove();
+    document.body.classList.remove('modal-open');
+    let fired = false;
+    if (pendingPostInstantWinPhase) {
+        pendingPostInstantWinPhase = false;
+        fired = true;
+        setTimeout(() => { maybeApplyTutorialPopups('post_instantwin'); evaluateDayCompletion(); }, 60);
+    }
+    else if (pendingPostBonusRoundPhase) {
+        pendingPostBonusRoundPhase = false;
+        fired = true;
+        setTimeout(() => { maybeApplyTutorialPopups('post_bonus_round'); evaluateDayCompletion(); }, 60);
+    }
+    else if (pendingPostMinigamePhase) {
+        pendingPostMinigamePhase = false;
+        fired = true;
+        setTimeout(() => { maybeApplyTutorialPopups('post_minigame'); evaluateDayCompletion(); }, 60);
+    }
+    // If no immediate post-* phase fired and we have a deferred category action queued (e.g. Day 3 bonus round), run it now.
+    if (!fired && deferredCategoryAction) {
+        const fn = deferredCategoryAction;
+        deferredCategoryAction = null;
+        // Slight delay so DOM has removed previous modal fully before opening the next
+        setTimeout(() => { fn(); }, 40);
+        fired = true; // treat as handled so evaluateDayCompletion waits for the resulting modal lifecycle
+    }
+    if (!fired) {
+        setTimeout(() => {
+            // First try day completion (may queue jackpot via existing evaluate logic if triggered at end of day)
+            evaluateDayCompletion();
+            // Also attempt post-tutorial jackpot trigger if player has full stars but day not ending yet
+            ensurePrizeStarJackpotAfterTutorials();
+        }, 60);
+    }
+    if (pendingMetaTrail) {
+        const run = () => { triggerMetaTrailAnimation(); pendingMetaTrail = false; };
+        setTimeout(run, 120);
+    }
+    setTimeout(() => { if (!document.querySelector('.modal-backdrop'))
+        launchPendingForcedMinigame(); }, 40);
+}
+// If tutorials just ended and player has 5/5 stars, auto open jackpot (once) even mid-day (e.g., after post_move pages finish)
+function ensurePrizeStarJackpotAfterTutorials() {
+    if (prizeStars < 5)
+        return;
+    if (prizeStarJackpotPlayedToday)
+        return;
+    // Don't open over an existing modal
+    if (document.querySelector('.modal-backdrop'))
+        return;
+    // Avoid interrupting chained tutorial flows: if any forced replay pending or tutorial popup would appear next, skip.
+    if (forceReplayPhases.size > 0)
+        return;
+    // Heuristic: if no tutorial popup just fired (closeModal path) and stars are full, show jackpot now.
+    openPrizeStarJackpot();
+}
+// Animate a simple travel of 🔑 and ⭐ from player token position to their respective counters
+function triggerMetaTrailAnimation() {
+    try {
+        if (!playerToken)
+            return;
+        const root = document.getElementById('app');
+        if (!root)
+            return;
+        const tokenGlobal = playerToken.getGlobalPosition();
+        const canvasRect = app.canvas.getBoundingClientRect();
+        const startX = canvasRect.left + tokenGlobal.x; // approximate world-to-screen (camera adjustments already in world position)
+        const startY = canvasRect.top + tokenGlobal.y;
+        const targets = [
+            { selector: '.sk-counter', glyph: '🔑' },
+            { selector: '.ps-counter', glyph: '⭐' }
+        ];
+        targets.forEach(t => {
+            const targetEl = document.querySelector(t.selector);
+            if (!targetEl)
+                return;
+            const rect = targetEl.getBoundingClientRect();
+            const midX = rect.left + rect.width / 2;
+            const midY = rect.top + rect.height / 2;
+            const el = document.createElement('div');
+            el.textContent = t.glyph;
+            Object.assign(el.style, {
+                position: 'fixed', left: `${startX}px`, top: `${startY}px`,
+                zIndex: '9999', fontSize: '20px', filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.6))',
+                transition: 'transform 780ms cubic-bezier(.4,.8,.2,1), opacity 780ms ease',
+                pointerEvents: 'none', opacity: '1'
+            });
+            document.body.appendChild(el);
+            requestAnimationFrame(() => {
+                const dx = midX - startX;
+                const dy = midY - startY;
+                el.style.transform = `translate(${dx}px,${dy}px) scale(0.6)`;
+                el.style.opacity = '0';
+            });
+            setTimeout(() => { el.remove(); }, 820);
+        });
+    }
+    catch (e) {
+        console.warn('Meta trail animation failed', e);
+    }
+}
+// Helper: if tutorial has any unseen post_minigame popups for today, set pending flag so they'll display after current modal closes.
+function maybeQueuePostMinigamePhase() {
+    if (pendingPostMinigamePhase)
+        return; // already queued
+    if (!isTutorialActive(dayState.day))
+        return;
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (!plan)
+        return;
+    const raw = plan.popups?.post_minigame;
+    if (!raw)
+        return; // nothing defined
+    // Determine if at least one post_minigame popup not yet shown
+    const pages = Array.isArray(raw) ? raw : [raw];
+    const unseen = pages.some(html => !shownPlanPopups.has(`${plan.day}:post_minigame:${html}`));
+    if (unseen) {
+        pendingPostMinigamePhase = true;
+    }
+}
+// Queue post_instantwin phase if any unseen popups exist for this day
+function maybeQueuePostInstantWinPhase() {
+    if (pendingPostInstantWinPhase)
+        return;
+    if (!isTutorialActive(dayState.day))
+        return;
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (!plan)
+        return;
+    const raw = plan.popups?.post_instantwin;
+    if (!raw)
+        return;
+    const pages = Array.isArray(raw) ? raw : [raw];
+    const unseen = pages.some(html => !shownPlanPopups.has(`${plan.day}:post_instantwin:${html}`));
+    if (unseen)
+        pendingPostInstantWinPhase = true;
+}
+function maybeQueuePostBonusRoundPhase() {
+    if (pendingPostBonusRoundPhase)
+        return;
+    if (!isTutorialActive(dayState.day))
+        return;
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (!plan)
+        return;
+    const raw = plan.popups?.post_bonus_round;
+    if (!raw)
+        return;
+    const pages = Array.isArray(raw) ? raw : [raw];
+    const unseen = pages.some(html => !shownPlanPopups.has(`${plan.day}:post_bonus_round:${html}`));
+    if (unseen)
+        pendingPostBonusRoundPhase = true;
+}
 // Fade overlay (CSS gradient) inserted once
 function ensureFadeOverlay(root) {
     // Narrow fade restricted to the game area's width (inside #pixi-root)
@@ -1021,11 +1577,13 @@ function handleResize() {
     centerCameraOnLevel(prevLevel, true);
     backgroundLayer.y = world.position.y;
     backgroundLayer.x = 0;
+    updateZoneCrossfade();
     updateCurrencyCounters();
 }
 // ---------------- Debug Overlay (toggle with '0') ----------------
 let debugShown = false;
 let debugEl = null;
+let debugButtonsEl = null; // holds clickable debug controls (separate from readonly overlay)
 function initDebugOverlay() {
     window.addEventListener('keydown', (e) => {
         if (e.key === '0') {
@@ -1041,11 +1599,107 @@ function initDebugOverlay() {
                         pointerEvents: 'none', whiteSpace: 'pre', backdropFilter: 'blur(3px)'
                     });
                 }
+                if (!debugButtonsEl) {
+                    debugButtonsEl = document.createElement('div');
+                    debugButtonsEl.className = 'debug-buttons';
+                    document.body.appendChild(debugButtonsEl);
+                    Object.assign(debugButtonsEl.style, {
+                        position: 'fixed', bottom: '10px', right: '10px', display: 'flex', flexDirection: 'column', gap: '6px',
+                        zIndex: '10000', padding: '8px', background: 'rgba(0,0,0,0.65)', border: '1px solid rgba(255,255,255,0.15)',
+                        borderRadius: '8px', font: '12px system-ui, sans-serif', boxShadow: '0 2px 6px rgba(0,0,0,0.4)'
+                    });
+                    const mkBtn = (label, game) => {
+                        const b = document.createElement('button');
+                        b.type = 'button';
+                        b.textContent = label;
+                        Object.assign(b.style, {
+                            cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+                            borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+                        });
+                        b.addEventListener('mouseenter', () => { b.style.background = '#333'; });
+                        b.addEventListener('mouseleave', () => { b.style.background = '#222'; });
+                        b.addEventListener('click', () => {
+                            const assign = { level: -1, game, completed: false };
+                            openMinigameModal(assign);
+                        });
+                        return b;
+                    };
+                    debugButtonsEl.appendChild(mkBtn('Force Slot', 'slot'));
+                    debugButtonsEl.appendChild(mkBtn('Force Spin Wheel', 'spin_wheel'));
+                    debugButtonsEl.appendChild(mkBtn('Force Loot Box', 'lootbox'));
+                    // Force Jackpot (Prize Star big game)
+                    const jackpotBtn = document.createElement('button');
+                    jackpotBtn.type = 'button';
+                    jackpotBtn.textContent = 'Force Jackpot';
+                    Object.assign(jackpotBtn.style, {
+                        cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+                        borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+                    });
+                    jackpotBtn.addEventListener('mouseenter', () => { jackpotBtn.style.background = '#333'; });
+                    jackpotBtn.addEventListener('mouseleave', () => { jackpotBtn.style.background = '#222'; });
+                    jackpotBtn.addEventListener('click', () => {
+                        // Set stars full and re-open jackpot overlay even if already played this day
+                        prizeStars = 5;
+                        prizeStarJackpotPlayedToday = false; // allow re-trigger
+                        saveCurrencies();
+                        updateCurrencyCounters();
+                        openPrizeStarJackpot();
+                    });
+                    debugButtonsEl.appendChild(jackpotBtn);
+                    // Force Dual Choice overlay (120 token milestone) & subgames
+                    const dualBtn = document.createElement('button');
+                    dualBtn.type = 'button';
+                    dualBtn.textContent = 'Force Dual Choice';
+                    Object.assign(dualBtn.style, {
+                        cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+                        borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+                    });
+                    dualBtn.addEventListener('mouseenter', () => { dualBtn.style.background = '#333'; });
+                    dualBtn.addEventListener('mouseleave', () => { dualBtn.style.background = '#222'; });
+                    dualBtn.addEventListener('click', () => {
+                        tokenDualPopupReady = true;
+                        tokenDualPopupConsumed = false; // re-arm
+                        openDualThresholdOverlay();
+                    });
+                    debugButtonsEl.appendChild(dualBtn);
+                    const specialScratchBtn = document.createElement('button');
+                    specialScratchBtn.type = 'button';
+                    specialScratchBtn.textContent = 'Force Special Scratch';
+                    Object.assign(specialScratchBtn.style, {
+                        cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+                        borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+                    });
+                    specialScratchBtn.addEventListener('mouseenter', () => { specialScratchBtn.style.background = '#333'; });
+                    specialScratchBtn.addEventListener('mouseleave', () => { specialScratchBtn.style.background = '#222'; });
+                    specialScratchBtn.addEventListener('click', () => { openSpecialScratchJackpotOverlay(); });
+                    debugButtonsEl.appendChild(specialScratchBtn);
+                    const megaBoxBtn = document.createElement('button');
+                    megaBoxBtn.type = 'button';
+                    megaBoxBtn.textContent = 'Force Mega Box';
+                    Object.assign(megaBoxBtn.style, {
+                        cursor: 'pointer', background: '#222', color: '#fff', border: '1px solid #444', padding: '4px 8px',
+                        borderRadius: '4px', fontSize: '12px', letterSpacing: '0.5px'
+                    });
+                    megaBoxBtn.addEventListener('mouseenter', () => { megaBoxBtn.style.background = '#333'; });
+                    megaBoxBtn.addEventListener('mouseleave', () => { megaBoxBtn.style.background = '#222'; });
+                    megaBoxBtn.addEventListener('click', () => { openMegaBoxGameOverlay(); });
+                    debugButtonsEl.appendChild(megaBoxBtn);
+                    // Close button for convenience
+                    const closeBtn = mkBtn('Close Debug (0)', 'slot');
+                    closeBtn.removeEventListener('click', () => { }); // remove earlier listener
+                    closeBtn.addEventListener('click', () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: '0' })); });
+                    Object.assign(closeBtn.style, { background: '#552222' });
+                    debugButtonsEl.appendChild(closeBtn);
+                }
                 updateDebugOverlay();
             }
             else if (debugEl) {
                 debugEl.remove();
                 debugEl = null;
+                if (debugButtonsEl) {
+                    debugButtonsEl.remove();
+                    debugButtonsEl = null;
+                }
             }
         }
     });
@@ -1065,6 +1719,7 @@ function updateDebugOverlay() {
     const ahead = Math.min(LEVEL_COUNT, current + 7);
     const visibleRange = `${current}-${ahead}`;
     const mgCount = minigameAssignments.length;
+    const catCount = categoryAssignments.length;
     debugEl.textContent =
         `VIEW: ${viewWidth}x${viewHeight}\n` +
             `TILE_RADIUS: ${TILE_RADIUS.toFixed(1)}\n` +
@@ -1073,7 +1728,9 @@ function updateDebugOverlay() {
             `paddings T:${TOP_VISIBLE_PADDING} B:${BOTTOM_VISIBLE_PADDING}\n` +
             `camera: (${camX}, ${camY})\n` +
             `progress: ${current}/${LEVEL_COUNT} visible:${visibleRange}\n` +
-            `minigames: ${mgCount}`;
+            `categories: ${catCount} minigames: ${mgCount}\n` +
+            `day: ${dayState.day} rollUsed:${dayState.rollUsed} level:${levelState.level}\n` +
+            `zone: ${currentZoneId}`;
 }
 // ---------------- Minigame Modals ----------------
 function openMinigameModal(assign) {
@@ -1083,46 +1740,107 @@ function openMinigameModal(assign) {
     const modal = document.createElement('div');
     modal.className = 'modal';
     modal.setAttribute('role', 'dialog');
-    modal.innerHTML = `<button class="close-btn" aria-label="Close">×</button><h2>${minigameTitle(assign.game)}</h2><div class="minigame" data-game="${assign.game}"></div><div class="result"></div><div class="modal-footer"><button class="secondary" data-action="close" type="button">Close</button></div>`;
+    modal.innerHTML = `<h2>${minigameTitle(assign.game)}</h2><div class="minigame" data-game="${assign.game}"></div><div class="result"></div><div class="modal-footer"><button class="secondary" data-action="close" type="button">Close</button></div>`;
     backdrop.addEventListener('click', e => { if (e.target === backdrop)
         closeModal(); });
-    modal.querySelector('.close-btn')?.addEventListener('click', closeModal);
     modal.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
     initMinigameUI(assign, modal.querySelector('.minigame'), modal.querySelector('.result'));
+    // Show stacked tutorial card after render
+    setTimeout(() => showStackedPreMinigameMessages(assign, modal), 140);
 }
 function minigameTitle(id) {
     switch (id) {
-        case 'stop_bar': return 'Stop The Bar';
-        case 'coin_flip': return 'Heads or Tails';
-        case 'rps': return 'Rock Paper Scissors';
-        case 'memory_flip': return 'Memory Flip';
         case 'slot': return '3x1 Slot';
         case 'spin_wheel': return 'Spin Wheel';
+        case 'lootbox': return 'Loot Box';
+        default: return 'Minigame';
     }
 }
 function initMinigameUI(assign, root, resultEl) {
-    switch (assign.game) {
-        case 'stop_bar':
-            initStopBar(root, assign, resultEl);
-            break;
-        case 'coin_flip':
-            initCoinFlip(root, assign, resultEl);
-            break;
-        case 'rps':
-            initRPS(root, assign, resultEl);
-            break;
-        case 'memory_flip':
-            initMemoryFlip(root, assign, resultEl);
-            break;
-        case 'slot':
-            initSlot(root, assign, resultEl);
-            break;
-        case 'spin_wheel':
-            initSpinWheel(root, assign, resultEl);
-            break;
+    if (!MINIGAMES.includes(assign.game)) {
+        // Attempt self-heal: pick a random available minigame and persist
+        assign.game = MINIGAMES[Math.floor(Math.random() * MINIGAMES.length)];
+        saveMinigameAssignments();
     }
+    switch (assign.game) {
+        case 'slot': return initSlot(root, assign, resultEl);
+        case 'spin_wheel': return initSpinWheel(root, assign, resultEl);
+        case 'lootbox': return initLootBox(root, assign, resultEl);
+        default:
+            root.innerHTML = `<p style='text-align:center;'>Minigame unavailable.</p>`;
+    }
+}
+// Dynamically overlay pre_minigame tutorial messages (instead of blocking before opening the game)
+// (Old full-screen overlay removed; replaced by showStackedPreMinigameMessages)
+function showStackedPreMinigameMessages(assign, modal) {
+    if (!isTutorialActive(dayState.day))
+        return;
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (!plan || !plan.popups || !plan.popups.pre_minigame)
+        return;
+    const raw = plan.popups.pre_minigame;
+    const pages = Array.isArray(raw) ? raw : [raw];
+    const toShow = pages.filter(html => {
+        const key = `${plan.day}:pre_minigame:${html}`;
+        if (shownPlanPopups.has(key))
+            return false;
+        shownPlanPopups.add(key);
+        return true;
+    });
+    if (!toShow.length)
+        return;
+    ensureTutorStyles();
+    const layer = document.createElement('div');
+    Object.assign(layer.style, {
+        position: 'fixed', left: '0', top: '0', right: '0', bottom: '0',
+        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+        background: 'rgba(0,0,0,0.45)', zIndex: '650',
+        padding: '0', overflow: 'auto'
+    });
+    const stage = document.createElement('div');
+    stage.className = 'tutor-stage';
+    // Let global tutor-stage padding/offset apply; ensure consistent centering below top shift
+    stage.style.minHeight = 'unset';
+    stage.style.width = '100%';
+    stage.style.maxWidth = 'var(--tutor-stage-max)';
+    // Additional downward shift specific to pre-minigame overlay to match normal tutorial vertical position
+    stage.style.marginTop = '150px';
+    const portraitWrap = document.createElement('div');
+    portraitWrap.className = 'tutor-portrait-wrap';
+    portraitWrap.innerHTML = `<img src='${carnivalCharacterUrl}' alt='Guide' class='tutor-character'/>`;
+    const speech = document.createElement('div');
+    speech.className = 'tutor-speech';
+    speech.innerHTML = `<div class='tutor-speech-arrow'></div><div class='tutor-speech-inner'><h2>Minigame</h2><div class='stacked-copy'></div><div class='tutor-actions stacked-actions' style='display:flex;align-items:center;justify-content:space-between;gap:16px;'><div class='ts-progress' style='font-size:12px;font-weight:600;opacity:.75;letter-spacing:.5px;'></div><div class='nav-btns' style='display:flex;gap:8px;'><button type='button' class='secondary ts-prev' style='display:none;'>Back</button><button type='button' class='primary ts-next'>Next</button></div></div></div>`;
+    const copyHolder = speech.querySelector('.stacked-copy');
+    layer.appendChild(stage);
+    stage.appendChild(speech);
+    stage.appendChild(portraitWrap);
+    modal.appendChild(layer);
+    let index = 0;
+    function render() {
+        copyHolder.innerHTML = `<div style='font-size:14px;line-height:1.55;'>${toShow[index]}</div>`;
+        const prog = speech.querySelector('.ts-progress');
+        const prevBtn = speech.querySelector('.ts-prev');
+        const nextBtn = speech.querySelector('.ts-next');
+        prog.textContent = `Step ${index + 1}/${toShow.length}`;
+        prevBtn.style.display = index > 0 ? 'inline-flex' : 'none';
+        nextBtn.textContent = index === toShow.length - 1 ? 'Finish' : 'Next';
+    }
+    speech.querySelector('.ts-prev')?.addEventListener('click', () => { if (index > 0) {
+        index--;
+        render();
+    } });
+    speech.querySelector('.ts-next')?.addEventListener('click', () => { if (index < toShow.length - 1) {
+        index++;
+        render();
+    }
+    else {
+        layer.remove();
+    } });
+    render();
 }
 function completeMinigame(assign, success, resultEl) {
     if (assign.completed) {
@@ -1135,120 +1853,64 @@ function completeMinigame(assign, success, resultEl) {
         if (reward.kind === 'nothing')
             msg = '<p><strong>No reward this time.</strong></p>';
         else {
-            applyReward(reward);
-            msg = `<p><strong>Reward:</strong> ${reward.label}</p>`;
+            applyReward(reward); // applies base reward
+            // Minigame-only meta currency bonus
+            addStreakKeys(1);
+            addPrizeStars(1);
+            updateCurrencyCounters();
+            msg = `<p><strong>Reward:</strong> ${reward.label}</p>${formatMetaBonusLine()}`;
+            pendingMetaTrail = true;
         }
     }
     else
         msg = '<p><strong>Try again tomorrow!</strong></p>';
     assign.completed = true;
     saveMinigameAssignments();
+    // Also mark the overarching category assignment as completed so the tile turns green (played out)
+    const catAssign = getCategoryAssignment(assign.level);
+    if (catAssign && !catAssign.completed) {
+        catAssign.completed = true;
+        saveCategoryAssignments();
+    }
     refreshStates();
     resultEl.innerHTML = msg;
+    // Flag minigame completion for day progression (evaluate after modal close to avoid UI clutter)
+    dayMinigameCompleted = true;
+    // Defer tutorial post_minigame popups until modal close (handled in closeModal)
+    pendingPostMinigamePhase = true;
 }
-// ---- Stop Bar ----
-function initStopBar(root, assign, resultEl) {
-    root.innerHTML = `<div class='stop-bar' style='position:relative;width:260px;height:34px;border:2px solid #444;border-radius:6px;margin:10px auto;background:#222;'>
-    <div class='green-zone' style='position:absolute;left:40%;width:20%;top:0;bottom:0;background:#2e7d32;opacity:0.5;'></div>
-    <div class='cursor' style='position:absolute;left:0;top:0;bottom:0;width:18px;background:#ff9f43;border-radius:4px;'></div>
-  </div>
-  <button class='primary' data-action='stop'>Stop</button>`;
-    const cursor = root.querySelector('.cursor');
-    const green = root.querySelector('.green-zone');
-    let dir = 1;
-    let pos = 0;
-    let anim = true;
-    function frame() { if (!anim)
-        return; pos += dir * 3; if (pos > 242) {
-        pos = 242;
-        dir = -1;
-    } if (pos < 0) {
-        pos = 0;
-        dir = 1;
-    } cursor.style.left = pos + 'px'; requestAnimationFrame(frame); }
-    requestAnimationFrame(frame);
-    root.querySelector('[data-action="stop"]')?.addEventListener('click', () => { anim = false; const cRect = cursor.getBoundingClientRect(); const gRect = green.getBoundingClientRect(); const overlap = !(cRect.right < gRect.left || cRect.left > gRect.right); completeMinigame(assign, overlap, resultEl); });
-}
-// ---- Coin Flip ----
-function initCoinFlip(root, assign, resultEl) {
-    root.innerHTML = `<div class='coin-choices'><button data-choice='H'>Heads</button><button data-choice='T'>Tails</button></div><div class='coin-result' style='margin-top:8px;'></div>`;
-    const res = root.querySelector('.coin-result');
-    root.querySelectorAll('button[data-choice]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            if (assign.completed)
-                return;
-            const choice = btn.dataset.choice;
-            res.textContent = 'Flipping...';
-            setTimeout(() => {
-                const flip = Math.random() < 0.5 ? 'H' : 'T';
-                const success = flip === choice;
-                res.textContent = 'Result: ' + (flip === 'H' ? 'Heads' : 'Tails');
-                completeMinigame(assign, success, resultEl);
-            }, 600);
-        });
-    });
-}
-// ---- Rock Paper Scissors ----
-function initRPS(root, assign, resultEl) {
-    const opts = ['rock', 'paper', 'scissors'];
-    root.innerHTML = `<div class='rps-buttons'>${opts.map(o => `<button data-rps='${o}'>${o}</button>`).join('')}</div><div class='rps-result' style='margin-top:6px;'></div>`;
-    const res = root.querySelector('.rps-result');
-    root.querySelectorAll('button[data-rps]').forEach(b => b.addEventListener('click', () => {
-        if (assign.completed)
-            return;
-        const player = b.dataset.rps;
-        const ai = opts[Math.floor(Math.random() * 3)];
-        let win = (player === 'rock' && ai === 'scissors') || (player === 'paper' && ai === 'rock') || (player === 'scissors' && ai === 'paper');
-        res.textContent = `You: ${player} vs ${ai}`;
-        completeMinigame(assign, win, resultEl);
-    }));
-}
-// ---- Memory Flip (3x3 one pair) ----
-function initMemoryFlip(root, assign, resultEl) {
-    const positions = Array.from({ length: 9 }, (_, i) => i);
-    const pairSymbol = '★';
-    const pair = positions.sort(() => Math.random() - 0.5).slice(0, 2);
-    let revealed = [];
-    let found = false;
-    let attempts = 0;
-    const maxAttempts = 6;
-    root.innerHTML = `<div class='mem-grid' style='display:grid;grid-template-columns:repeat(3,54px);gap:6px;'>${positions.map(i => `<button class='card' data-idx='${i}' style='height:54px;font-size:20px;'>?</button>`).join('')}</div><div class='mem-status'></div>`;
-    const status = root.querySelector('.mem-status');
-    function update() { status.textContent = found ? 'Pair found!' : `Attempts: ${attempts}/${maxAttempts}`; }
-    update();
-    root.querySelectorAll('.card').forEach(btn => {
-        btn.addEventListener('click', () => {
-            if (assign.completed || found)
-                return;
-            const idx = Number(btn.dataset.idx);
-            if (revealed.includes(idx))
-                return;
-            btn.textContent = pair.includes(idx) ? pairSymbol : '✧';
-            revealed.push(idx);
-            if (revealed.length === 2) {
-                attempts++;
-                if (pair.every(p => revealed.includes(p))) {
-                    found = true;
-                    completeMinigame(assign, true, resultEl);
-                }
-                else {
-                    setTimeout(() => {
-                        revealed.forEach(r => { const b = root.querySelector(`.card[data-idx='${r}']`); if (b)
-                            b.textContent = '?'; });
-                        revealed = [];
-                        update();
-                        if (attempts >= maxAttempts && !found)
-                            completeMinigame(assign, false, resultEl);
-                    }, 600);
-                }
-            }
-            else if (revealed.length > 2) {
-                // reset logic safety
-                revealed = [];
-            }
-            update();
-        });
-    });
+// Helper for minigames that determine reward themselves (spin wheel / lootbox)
+function finalizeMinigameManual(assign, reward, resultEl) {
+    if (assign.completed)
+        return;
+    let msg = '';
+    if (reward) {
+        if (reward.kind === 'nothing') {
+            msg = '<p><strong>No reward this time.</strong></p>';
+        }
+        else {
+            applyReward(reward);
+            addStreakKeys(1);
+            addPrizeStars(1);
+            updateCurrencyCounters();
+            msg = `<p><strong>Reward:</strong> ${reward.label}</p>${formatMetaBonusLine()}`;
+            pendingMetaTrail = true;
+        }
+    }
+    else {
+        msg = '<p><strong>Try again tomorrow!</strong></p>';
+    }
+    assign.completed = true;
+    saveMinigameAssignments();
+    const catAssign = getCategoryAssignment(assign.level);
+    if (catAssign && !catAssign.completed) {
+        catAssign.completed = true;
+        saveCategoryAssignments();
+    }
+    refreshStates();
+    resultEl.innerHTML = msg;
+    dayMinigameCompleted = true;
+    pendingPostMinigamePhase = true;
 }
 // ---- Slot (3x1) ----
 function initSlot(root, assign, resultEl) {
@@ -1261,7 +1923,18 @@ function initSlot(root, assign, resultEl) {
     root.querySelector('[data-action="spin"]')?.addEventListener('click', () => {
         if (assign.completed)
             return;
-        const win = Math.random() < 0.5; // 50/50 rig
+        let plan = getTutorialPlanForDay(dayState.day);
+        let forcedSymbols = null;
+        if (plan && plan.reward.kind === 'minigame' && plan.reward.minigame === 'slot') {
+            const r = plan.reward;
+            if (Array.isArray(r.forceSlotSymbols) && r.forceSlotSymbols.length === 3) {
+                forcedSymbols = r.forceSlotSymbols;
+            }
+            else if (r.forceSlotSymbol) {
+                forcedSymbols = [r.forceSlotSymbol, r.forceSlotSymbol, r.forceSlotSymbol];
+            }
+        }
+        const win = forcedSymbols ? true : Math.random() < 0.5; // if forcing, treat as win scenario for reward
         const reels = Array.from(root.querySelectorAll('.reel'));
         let spinCount = 0;
         const interval = setInterval(() => {
@@ -1269,45 +1942,314 @@ function initSlot(root, assign, resultEl) {
             spinCount++;
             if (spinCount > 15) {
                 clearInterval(interval);
-                const finalSymbol = win ? '⭐' : symbols[Math.floor(Math.random() * symbols.length)];
-                reels.forEach(r => r.textContent = finalSymbol);
-                completeMinigame(assign, win, resultEl);
+                if (forcedSymbols) {
+                    reels.forEach((r, i) => r.textContent = forcedSymbols[i]);
+                    completeMinigame(assign, true, resultEl);
+                }
+                else {
+                    const finalSymbol = win ? '⭐' : symbols[Math.floor(Math.random() * symbols.length)];
+                    reels.forEach(r => r.textContent = finalSymbol);
+                    completeMinigame(assign, win, resultEl);
+                }
             }
         }, 80);
     });
 }
 // ---- Spin Wheel ----
 function initSpinWheel(root, assign, resultEl) {
-    // Show simplified wheel as a list; highlight chosen after spin
-    root.innerHTML = `<div class='wheel' style='max-height:140px;overflow:auto;border:1px solid #444;margin-bottom:8px;'>${REWARDS.map((r, i) => `<div class='wheel-slot' data-i='${i}' style='padding:4px;'>${r.label}</div>`).join('')}</div><button class='primary' data-action='spinwheel'>Spin</button>`;
-    root.querySelector('[data-action="spinwheel"]')?.addEventListener('click', () => {
-        if (assign.completed)
-            return;
-        const targetIdx = Math.floor(Math.random() * REWARDS.length);
-        const slots = root.querySelectorAll('.wheel-slot');
-        let idx = 0;
-        let cycles = 0;
-        const spinTimer = setInterval(() => {
-            slots.forEach(s => s.style.background = '');
-            slots[idx].style.background = '#ff9f43';
-            idx = (idx + 1) % slots.length;
-            cycles++;
-            if (cycles > REWARDS.length * 4 && idx === targetIdx) {
-                clearInterval(spinTimer);
-                slots.forEach(s => s.style.background = '');
-                slots[targetIdx].style.background = '#4caf50';
-                const reward = REWARDS[targetIdx];
-                if (reward.kind === 'nothing')
-                    completeMinigame(assign, false, resultEl);
-                else {
-                    applyReward(reward);
-                    (resultEl.innerHTML = `<p><strong>Reward:</strong> ${reward.label}</p>`);
-                    assign.completed = true;
-                    saveMinigameAssignments();
-                    refreshStates();
-                }
+    // Graphical circular wheel
+    const sliceCount = REWARDS.length;
+    const size = 260; // pixel diameter
+    root.innerHTML = `<div style='position:relative;width:${size}px;height:${size}px;margin:0 auto 12px;'>
+    <canvas class='spin-wheel-canvas' width='${size}' height='${size}' style='width:${size}px;height:${size}px;display:block;'></canvas>
+    <div class='wheel-pointer' style='position:absolute;left:50%;bottom:-10px;transform:translateX(-50%);width:0;height:0;border-left:16px solid transparent;border-right:16px solid transparent;border-bottom:30px solid #ff9f43;filter:drop-shadow(0 2px 4px rgba(0,0,0,.6));'></div>
+  </div>
+  <button class='primary' data-action='spinwheel'>Spin</button>`;
+    const canvas = root.querySelector('.spin-wheel-canvas');
+    const ctx = canvas.getContext('2d');
+    if (!ctx)
+        return;
+    const cx = ctx; // non-null assertion helper
+    const center = size / 2;
+    const radius = size / 2 - 4;
+    // Pre-pick target slice for fairness and compute final rotation to land that slice at pointer (pointer at top / angle 0)
+    let plan = getTutorialPlanForDay(dayState.day);
+    let targetIndex = Math.floor(Math.random() * sliceCount);
+    if (isTutorialActive(dayState.day)) {
+        // Avoid landing on 'nothing' slice during tutorial unless all slices are nothing (they aren't)
+        let guard = 0;
+        while (REWARDS[targetIndex].kind === 'nothing' && guard < 25) {
+            targetIndex = Math.floor(Math.random() * sliceCount);
+            guard++;
+        }
+    }
+    if (plan && plan.reward.kind === 'minigame' && plan.reward.minigame === 'spin_wheel') {
+        const r = plan.reward;
+        // Try label first
+        if (r.forceSpinWheelLabel) {
+            const idx = REWARDS.findIndex(w => w.label === r.forceSpinWheelLabel);
+            if (idx >= 0)
+                targetIndex = idx;
+        }
+        else if (r.forceSpinWheelKind || r.forceSpinWheelAmount !== undefined) {
+            const idx = REWARDS.findIndex(w => (r.forceSpinWheelKind ? w.kind === r.forceSpinWheelKind : true) && (r.forceSpinWheelAmount !== undefined ? w.amount === r.forceSpinWheelAmount : true));
+            if (idx >= 0)
+                targetIndex = idx;
+        }
+    }
+    // Draw static wheel (we'll rotate canvas using CSS transform)
+    const colors = ['#243240', '#2f4256', '#364d63', '#2a3947'];
+    function drawWheel(rotation) {
+        cx.clearRect(0, 0, size, size);
+        cx.save();
+        cx.translate(center, center);
+        // Apply 180deg base rotation so visual slice mapping inverts
+        // Bottom pointer: natural 0 angle points to the right; we want slice centers to pass bottom (angle = Math.PI/2)
+        cx.rotate(rotation);
+        const arc = (Math.PI * 2) / sliceCount;
+        for (let i = 0; i < sliceCount; i++) {
+            cx.beginPath();
+            cx.moveTo(0, 0);
+            cx.fillStyle = colors[i % colors.length];
+            cx.arc(0, 0, radius, i * arc, (i + 1) * arc);
+            cx.closePath();
+            cx.fill();
+            cx.save();
+            cx.rotate(i * arc + arc / 2);
+            cx.translate(radius * 0.62, 0);
+            cx.rotate(Math.PI / 2);
+            cx.fillStyle = '#fff';
+            cx.font = '12px system-ui, sans-serif';
+            cx.textAlign = 'center';
+            cx.textBaseline = 'middle';
+            const reward = REWARDS[i];
+            const short = reward.kind === 'tokens' ? `${reward.amount}T` :
+                reward.kind === 'freePlays' ? `${reward.amount}FP` :
+                    reward.kind === 'cash' ? `${(reward.amount || 0) / 100}£` :
+                        reward.kind === 'bonus' ? `${(reward.amount || 0) / 100}B` :
+                            reward.kind === 'streakKeys' ? `${reward.amount}K` :
+                                reward.kind === 'prizeStars' ? `${reward.amount}★` : '—';
+            const icon = reward.kind === 'tokens' ? '🪙' :
+                reward.kind === 'freePlays' ? '▶️' :
+                    reward.kind === 'cash' ? '💷' :
+                        reward.kind === 'bonus' ? '🎟️' :
+                            reward.kind === 'streakKeys' ? '🔑' :
+                                reward.kind === 'prizeStars' ? '⭐' : 'Ø';
+            wrapText(cx, icon + '\n' + short, 0, 0, 70, 12);
+            cx.restore();
+        }
+        cx.restore();
+    }
+    function wrapText(context, text, x, y, maxWidth, lineHeight) {
+        const words = text.split(' ');
+        let line = '';
+        const lines = [];
+        for (const w of words) {
+            const test = line ? line + ' ' + w : w;
+            if (context.measureText(test).width > maxWidth) {
+                lines.push(line);
+                line = w;
             }
-        }, 80);
+            else
+                line = test;
+        }
+        if (line)
+            lines.push(line);
+        const offsetY = -((lines.length - 1) * lineHeight) / 2;
+        lines.forEach((ln, i) => context.fillText(ln, x, y + offsetY + i * lineHeight));
+    }
+    drawWheel(0);
+    const spinBtn = root.querySelector('[data-action="spinwheel"]');
+    let spinning = false;
+    spinBtn.addEventListener('click', () => {
+        if (spinning || assign.completed)
+            return;
+        spinning = true;
+        spinBtn.disabled = true;
+        spinBtn.textContent = 'Spinning...';
+        // physics-ish spin: base rotations + random extra, then land precisely so targetIndex is selected
+        const arc = (Math.PI * 2) / sliceCount;
+        const baseRotations = 6; // full turns
+        // Pointer now at top but wheel pre-rotated 180deg; adjust final angle accordingly
+        // We want target slice center to end at angle Math.PI/2 (bottom). Current rotation adds rotation value positively.
+        // Slice center angle (without rotation) = targetIndex*arc + arc/2. We solve rotation so: (sliceAngle + rotation) mod 2PI = Math.PI/2
+        // => rotation = Math.PI/2 - sliceAngle
+        const sliceAngle = targetIndex * arc + arc / 2;
+        const finalAngle = (Math.PI / 2) - sliceAngle;
+        const totalRotation = baseRotations * Math.PI * 2 + finalAngle + (Math.random() * arc - arc / 2) * 0.15; // slight jitter without changing target index
+        const duration = 3800;
+        const start = performance.now();
+        function easeOutQuart(t) { return 1 - Math.pow(1 - t, 4); }
+        function animate(now) {
+            const t = Math.min(1, (now - start) / duration);
+            const eased = easeOutQuart(t);
+            const current = totalRotation * eased;
+            drawWheel(current);
+            if (t < 1)
+                requestAnimationFrame(animate);
+            else
+                finish();
+        }
+        requestAnimationFrame(animate);
+        function finish() {
+            let reward = REWARDS[targetIndex];
+            if (isTutorialActive(dayState.day) && reward.kind === 'nothing') {
+                // Failsafe: pick nearest non-nothing reward deterministically
+                const forward = [...REWARDS.slice(targetIndex + 1), ...REWARDS.slice(0, targetIndex)];
+                const alt = forward.find(r => r.kind !== 'nothing');
+                if (alt)
+                    reward = alt;
+            }
+            finalizeMinigameManual(assign, reward, resultEl);
+        }
+    });
+}
+// ---- Loot Box ----
+function initLootBox(root, assign, resultEl) {
+    const rarityStyles = {
+        common: { color: '#ddd', bg: '#2a2a2a' },
+        uncommon: { color: '#b1f29d', bg: '#244a28' },
+        rare: { color: '#82c7ff', bg: '#14344d' },
+        epic: { color: '#d5a6ff', bg: '#41245b' },
+        mythic: { color: '#ffdf7f', bg: '#5a430f' }
+    };
+    // Map existing rewards to rarities (tune as desired)
+    const weighted = REWARDS.map(r => {
+        let rarity = 'common';
+        let weight = 30;
+        if (r.kind === 'nothing') {
+            rarity = 'common';
+            // During tutorial days, either zero weight or drastically reduce chance for 'nothing'
+            weight = isTutorialActive(dayState.day) ? 0 : 40;
+        }
+        else if (r.kind === 'tokens' && (r.amount || 0) >= 50) {
+            rarity = 'uncommon';
+            weight = 18;
+        }
+        else if (r.kind === 'cash' && (r.amount || 0) >= 100) {
+            rarity = 'rare';
+            weight = 10;
+        }
+        else if (r.kind === 'bonus' && (r.amount || 0) >= 500) {
+            rarity = 'epic';
+            weight = 4;
+        }
+        else if (r.kind === 'tokens' && (r.amount || 0) >= 100) {
+            rarity = 'rare';
+            weight = 8;
+        }
+        else if (r.kind === 'freePlays' && (r.amount || 0) >= 5) {
+            rarity = 'rare';
+            weight = 7;
+        }
+        else if (r.kind === 'bonus' && (r.amount || 0) >= 100) {
+            rarity = 'uncommon';
+            weight = 16;
+        }
+        return { reward: r, weight, rarity };
+    });
+    // If tutorial removed 'nothing', and all weights zero for that entry, filter it out to prevent zero-sum total.
+    const effectiveWeighted = weighted.filter(w => w.weight > 0);
+    function pickWeighted() {
+        const pool = effectiveWeighted.length ? effectiveWeighted : weighted; // fallback if somehow emptied
+        const total = pool.reduce((s, w) => s + w.weight, 0);
+        let roll = Math.random() * total;
+        for (const w of pool) {
+            if (roll < w.weight)
+                return w;
+            roll -= w.weight;
+        }
+        return pool[0];
+    }
+    // Pre-determine final reward for fairness
+    let final = pickWeighted();
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (plan && plan.reward.kind === 'minigame' && plan.reward.minigame === 'lootbox') {
+        const r = plan.reward;
+        let forced;
+        if (r.forceLootboxLabel)
+            forced = REWARDS.find(rr => rr.label === r.forceLootboxLabel);
+        if (!forced && (r.forceLootboxKind || r.forceLootboxAmount !== undefined)) {
+            forced = REWARDS.find(rr => (r.forceLootboxKind ? rr.kind === r.forceLootboxKind : true) && (r.forceLootboxAmount !== undefined ? rr.amount === r.forceLootboxAmount : true));
+        }
+        if (forced) {
+            final = { reward: forced, weight: 1, rarity: 'rare' }; // rarity nominal
+        }
+    }
+    // Build reel items (populate with random rewards, ensure final appears near end so decel lands there)
+    const ITEM_COUNT = 48;
+    const FINAL_INDEX = 40; // stop with item centered
+    const reelRewards = [];
+    for (let i = 0; i < ITEM_COUNT; i++) {
+        if (i === FINAL_INDEX)
+            reelRewards.push(final);
+        else
+            reelRewards.push(pickWeighted());
+    }
+    root.innerHTML = `<div style='display:flex;flex-direction:column;align-items:center;gap:14px;width:100%;'>
+    <div class='lootbox-reel-wrapper' style='position:relative;width:320px;height:86px;overflow:hidden;border:3px solid #555;border-radius:14px;background:#111;'>
+      <div class='indicator' style='position:absolute;left:50%;top:0;bottom:0;width:2px;background:#ff9f43;box-shadow:0 0 6px #ff9f43;transform:translateX(-50%);pointer-events:none;'></div>
+      <div class='lootbox-track' style='display:flex;align-items:center;gap:8px;will-change:transform;padding:8px;'></div>
+    </div>
+  <button class='primary' data-action='open'>Start</button>
+  </div>`;
+    const track = root.querySelector('.lootbox-track');
+    reelRewards.forEach(rw => {
+        const st = rarityStyles[rw.rarity];
+        const el = document.createElement('div');
+        el.className = 'lb-item';
+        el.style.cssText = `flex:0 0 96px;height:60px;border:2px solid ${st.color};border-radius:10px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;font-weight:600;letter-spacing:.5px;text-align:center;color:${st.color};background:${st.bg};padding:4px;box-shadow:0 0 4px rgba(0,0,0,.6);`;
+        el.innerHTML = `<span style='font-size:12px;'>${rw.reward.label.replace(/\s+/g, '<br>')}</span>`;
+        track.appendChild(el);
+    });
+    const btn = root.querySelector('[data-action="open"]');
+    let started = false;
+    btn.addEventListener('click', () => {
+        if (started || assign.completed)
+            return;
+        started = true;
+        btn.disabled = true;
+        btn.textContent = 'Opening...';
+        const itemWidth = 96 + 8; // width + gap
+        const targetOffset = (FINAL_INDEX * itemWidth) - (320 / 2 - itemWidth / 2);
+        const duration = 4500;
+        const start = performance.now();
+        function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+        function frame(now) {
+            const t = Math.min(1, (now - start) / duration);
+            const eased = easeOutCubic(t);
+            const current = targetOffset * eased;
+            track.style.transform = `translateX(${-current}px)`;
+            if (t < 1)
+                requestAnimationFrame(frame);
+            else
+                finish();
+        }
+        requestAnimationFrame(frame);
+        function finish() {
+            const wrapper = root.querySelector('.lootbox-reel-wrapper');
+            const indicatorX = wrapper.getBoundingClientRect().left + wrapper.clientWidth / 2;
+            let bestIndex = 0;
+            let bestDist = Infinity;
+            let bestEl = null;
+            Array.from(track.children).forEach((c, i) => {
+                const rect = c.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const d = Math.abs(cx - indicatorX);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestIndex = i;
+                    bestEl = c;
+                }
+            });
+            const finalEl = bestEl || track.children[FINAL_INDEX];
+            finalEl.style.outline = '3px solid #fff';
+            finalEl.animate([
+                { transform: 'scale(1)' }, { transform: 'scale(1.15)' }, { transform: 'scale(1)' }
+            ], { duration: 600, easing: 'ease' });
+            const rewardObj = reelRewards[bestIndex].reward;
+            finalizeMinigameManual(assign, rewardObj, resultEl);
+        }
     });
 }
 // ---------------- Dice Roll UI ----------------
@@ -1318,26 +2260,22 @@ function renderDice() {
         bar = document.createElement('div');
         bar.className = 'dice-bar';
         bar.innerHTML = `
-      <div class="dice-wrapper" style="display:flex;align-items:flex-end;gap:24px;">
-        <div class="dice-buttons" style="display:flex;flex-direction:row;gap:12px;">
-          <button type="button" class="dice-btn dice-roll-btn" aria-label="Roll" title="Roll">Roll</button>
-          <button type="button" class="dice-btn dice-retreat-btn" aria-label="Reverse-Roll" title="Reverse-Roll">Reverse-Roll</button>
-        </div>
-        <div class="dice-face shared" aria-live="polite" aria-label="Dice result">-</div>
+      <div class="dice-wrapper" style="display:flex;align-items:center;justify-content:center;">
+        <button type="button" class="dice-cube dice-roll-btn" aria-label="Roll Dice" title="Roll Dice">-</button>
       </div>`;
         document.getElementById('app')?.appendChild(bar);
         const rollBtn = bar.querySelector('.dice-roll-btn');
-        const sharedFace = bar.querySelector('.dice-face.shared');
-        const revBtn = bar.querySelector('.dice-retreat-btn');
+        const sharedFace = rollBtn; // rolled value appears on the dice itself
         // Style injection for dice if missing
         if (!document.getElementById('dice-style')) {
             const style = document.createElement('style');
             style.id = 'dice-style';
             style.textContent = `.dice-bar{display:flex;justify-content:center;margin-top:6px;}
-        .dice-btn{background:#ff9f43;border:0;color:#111;padding:10px 16px;font-weight:700;border-radius:10px;cursor:pointer;box-shadow:0 2px 4px rgba(0,0,0,0.4);transition:transform .15s,background .2s;}
-        .dice-btn:disabled{opacity:.5;cursor:default;}
-        .dice-btn:hover:not(:disabled){transform:translateY(-2px);}
-        .dice-face.shared{min-width:48px;min-height:48px;background:#222;border:3px solid #ff9f43;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#fff;}
+        .dice-cube{width:72px;height:72px;background:#222;border:4px solid #ff9f43;border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;cursor:pointer;box-shadow:0 4px 10px rgba(0,0,0,0.5);transition:transform .18s, background .25s, box-shadow .25s;}
+        .dice-cube:hover:not(:disabled){transform:translateY(-3px) rotateZ(-3deg);}
+        .dice-cube:disabled{opacity:.55;cursor:default;}
+        .dice-cube.daily-used{background:#3a3f44 !important;color:#888;box-shadow:inset 0 0 0 3px #555;}
+        .dice-cube.daily-used::after{content:'Daily used';position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-size:11px;font-weight:600;color:#bbb;letter-spacing:.5px;}
       `;
             document.head.appendChild(style);
         }
@@ -1348,44 +2286,31 @@ function renderDice() {
                 sharedFace.textContent = '🏁';
                 return;
             }
-            isRolling = true;
-            rollBtn.disabled = true;
-            revBtn.disabled = true;
-            let ticks = 0;
-            const target = 1 + Math.floor(Math.random() * 6);
-            const spin = setInterval(() => {
-                ticks++;
-                sharedFace.textContent = String(1 + Math.floor(Math.random() * 6));
-                if (ticks >= 10) {
-                    clearInterval(spin);
-                    sharedFace.textContent = String(target);
-                    // Advance by rolled value
-                    advanceBy(target);
-                    setTimeout(() => { isRolling = false; rollBtn.disabled = false; revBtn.disabled = false; }, 900);
-                }
-            }, 80);
-        });
-        revBtn.addEventListener('click', () => {
-            if (isRolling)
-                return;
-            if (progress.current <= 1) {
-                sharedFace.textContent = '⛔';
+            if (dayState.rollUsed) {
                 return;
             }
+            maybeApplyTutorialPopups('pre_roll');
             isRolling = true;
-            revBtn.disabled = true;
             rollBtn.disabled = true;
+            rollBtn.classList.remove('can-roll');
+            rollBtn.classList.add('spinning');
             let ticks = 0;
-            const target = 1 + Math.floor(Math.random() * 6);
+            let target = 1 + Math.floor(Math.random() * 6);
+            const plan = getTutorialPlanForDay(dayState.day);
+            if (plan && plan.forcedDice >= 1 && plan.forcedDice <= 6)
+                target = plan.forcedDice;
             const spin = setInterval(() => {
                 ticks++;
                 sharedFace.textContent = String(1 + Math.floor(Math.random() * 6));
                 if (ticks >= 10) {
                     clearInterval(spin);
                     sharedFace.textContent = String(target);
-                    retreatBy(target);
-                    // Buttons re-enabled after a conservative delay; actual auto-trigger scheduled within retreatBy final landing.
-                    setTimeout(() => { isRolling = false; revBtn.disabled = false; rollBtn.disabled = false; }, 950);
+                    maybeApplyTutorialPopups('post_roll');
+                    advanceBy(target);
+                    dayState.rollUsed = true;
+                    saveDayState();
+                    updateDayUI();
+                    setTimeout(() => { isRolling = false; rollBtn.classList.remove('spinning'); updateDayUI(); }, 900);
                 }
             }, 80);
         });
@@ -1409,18 +2334,19 @@ function openLegendModal() {
         { cat: 'extra_move', label: 'Extra Move', desc: 'Automatically roll forward again.' },
         { cat: 'travel_back', label: 'Travel Back', desc: 'Move backwards (no reward).' }
     ];
-    modal.innerHTML = `<button class="close-btn" aria-label="Close">×</button><h2>Tile Legend</h2>
+    modal.innerHTML = `<h2>Tile Legend</h2>
   <div class='legend-list' style='display:flex;flex-direction:column;gap:10px;max-height:360px;overflow:auto;'>
     ${items.map(i => `<div style='display:flex;align-items:center;gap:10px;'>
       <canvas data-shape='${i.cat}' width='52' height='52' style='background:transparent;'></canvas>
       <div><strong>${i.label}</strong><br/><span style='font-size:12px;opacity:.85;'>${i.desc}</span></div>
     </div>`).join('')}
-  </div>`;
+  </div><div class='modal-footer'><button class='primary' data-action='close'>Close</button></div>`;
     backdrop.addEventListener('click', e => { if (e.target === backdrop)
         closeModal(); });
-    modal.querySelector('.close-btn')?.addEventListener('click', closeModal);
+    modal.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
     setTimeout(() => {
         modal.querySelectorAll('canvas[data-shape]').forEach(cnv => {
             const ctx = cnv.getContext('2d');
@@ -1496,23 +2422,52 @@ function openInfoModal(title, bodyHtml, onClose) {
     const modal = document.createElement('div');
     modal.className = 'modal';
     modal.setAttribute('role', 'dialog');
-    modal.innerHTML = `<button class="close-btn" aria-label="Close">×</button><h2>${title}</h2><div class='body'>${bodyHtml}</div><div class='modal-footer'><button class='primary' data-action='close'>Close</button></div>`;
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) {
-        closeModal();
-        onClose?.();
-    } });
-    modal.querySelector('.close-btn')?.addEventListener('click', () => { closeModal(); onClose?.(); });
+    const tutorialContext = isTutorialActive(dayState.day) && (title === 'Info' || title === 'Tutorial');
+    if (tutorialContext) {
+        ensureTutorStyles();
+        modal.classList.add('tutor-modal');
+        modal.innerHTML = `<div class='tutor-stage'>
+        <div class='tutor-portrait-wrap'>
+          <img src='${carnivalCharacterUrl}' alt='Guide' class='tutor-character'/>
+        </div>
+        <div class='tutor-speech'>
+          <div class='tutor-speech-arrow'></div>
+          <div class='tutor-speech-inner'>
+            <h2>${title}</h2>
+            <div class='tutor-text'>${bodyHtml}</div>
+            <div class='tutor-actions'><button class='primary' data-action='close'>Close</button></div>
+          </div>
+        </div>
+      </div>`;
+    }
+    else {
+        modal.innerHTML = `<h2>${title}</h2><div class='body'>${bodyHtml}</div><div class='modal-footer'><button class='primary' data-action='close'>Close</button></div>`;
+    }
+    // Disable backdrop dismissal for tutorial clarity
+    backdrop.addEventListener('click', e => { });
     modal.querySelector('[data-action="close"]')?.addEventListener('click', () => { closeModal(); onClose?.(); });
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
 }
 function openInstantTokensModal(assign) {
     const amount = randInt(10, 50);
     addTokens(amount);
+    // Meta bonus (instant rewards now also grant key & star)
+    addStreakKeys(1);
+    addPrizeStars(1);
+    pendingMetaTrail = true;
     assign.completed = true;
     saveCategoryAssignments();
     refreshStates();
-    openInfoModal('Instant Tokens', `<p>You received <strong>${amount} Tokens</strong>.</p>`);
+    openInfoModal('Instant Tokens', `<p>You received <strong>${amount} Tokens</strong>.</p>${formatMetaBonusLine()}`, () => {
+        const wasPending = pendingPostInstantWinPhase;
+        maybeQueuePostInstantWinPhase();
+        if (pendingPostInstantWinPhase || wasPending) {
+            pendingPostInstantWinPhase = false;
+            maybeApplyTutorialPopups('post_instantwin');
+        }
+    });
 }
 function randomInstantPrize() {
     const kind = ['freePlays', 'bonus', 'cash'][randInt(0, 2)];
@@ -1539,64 +2494,70 @@ function randomBonusRoundPrize() {
     return { label, apply: () => { } }; // already applied
 }
 function openInstantPrizeModal(assign) {
-    const prize = randomInstantPrize();
-    prize.apply();
+    let label;
+    if (assign.forcedReward) {
+        applyReward(assign.forcedReward);
+        label = assign.forcedReward.label;
+    }
+    else {
+        const prize = randomInstantPrize();
+        prize.apply();
+        label = prize.label;
+    }
+    // Meta bonus
+    addStreakKeys(1);
+    addPrizeStars(1);
+    pendingMetaTrail = true;
     assign.completed = true;
     saveCategoryAssignments();
     refreshStates();
-    openInfoModal('Instant Prize', `<p>You won <strong>${prize.label}</strong>.</p>`);
+    openInfoModal('Instant Prize', `<p>You won <strong>${label}</strong>.</p>${formatMetaBonusLine()}`, () => {
+        const wasPending = pendingPostInstantWinPhase;
+        maybeQueuePostInstantWinPhase();
+        if (pendingPostInstantWinPhase || wasPending) {
+            pendingPostInstantWinPhase = false;
+            maybeApplyTutorialPopups('post_instantwin');
+        }
+    });
 }
 function openBonusRoundModal(assign) {
     const prize = randomBonusRoundPrize(); // already applied
+    addStreakKeys(1);
+    addPrizeStars(1);
+    pendingMetaTrail = true;
     assign.completed = true;
     saveCategoryAssignments();
     refreshStates();
-    openInfoModal('BONUS ROUND', `<p><strong>${prize.label}</strong></p>`);
+    openInfoModal('BONUS ROUND', `<p><strong>${prize.label}</strong></p>${formatMetaBonusLine()}`, () => {
+        const wasPending = pendingPostBonusRoundPhase;
+        maybeQueuePostBonusRoundPhase();
+        if (pendingPostBonusRoundPhase || wasPending) {
+            // Ensure full chain shows even if previously partially shown
+            forceReplayPhases.add('post_bonus_round');
+            pendingPostBonusRoundPhase = false;
+            maybeApplyTutorialPopups('post_bonus_round');
+        }
+    });
 }
 function openRevealModal(assign) {
+    // Simplified: direct reveal (pick-1-of-3 removed)
     closeModal();
     const reward = randomInstantPrize();
-    const winningIndex = randInt(0, 2);
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    const modal = document.createElement('div');
-    modal.className = 'modal';
-    modal.setAttribute('role', 'dialog');
-    modal.innerHTML = `<button class='close-btn' aria-label='Close'>×</button><h2>Reveal</h2><p>Pick a chest.</p>
-    <div class='chest-row' style='display:flex;gap:24px;justify-content:center;margin:16px 0;'>
-      ${[0, 1, 2].map(i => `<button class='chest-btn' data-i='${i}' style='width:82px;height:82px;border:2px solid #555;border-radius:10px;background:#222;font-size:38px;cursor:pointer;'>🗃️</button>`).join('')}
-    </div><div class='result'></div>`;
-    const resultEl = modal.querySelector('.result');
-    function finish(win) {
-        if (win) {
-            reward.apply();
-            resultEl.innerHTML = `<p>You found <strong>${reward.label}</strong>!</p>`;
+    reward.apply();
+    addStreakKeys(1);
+    addPrizeStars(1);
+    pendingMetaTrail = true;
+    assign.completed = true;
+    saveCategoryAssignments();
+    refreshStates();
+    openInfoModal('Reveal', `<p>You uncovered <strong>${reward.label}</strong>.</p>${formatMetaBonusLine()}`, () => {
+        const wasPending = pendingPostInstantWinPhase;
+        maybeQueuePostInstantWinPhase();
+        if (pendingPostInstantWinPhase || wasPending) {
+            pendingPostInstantWinPhase = false;
+            maybeApplyTutorialPopups('post_instantwin');
         }
-        else
-            resultEl.innerHTML = `<p>Empty! Prize was <strong>${reward.label}</strong></p>`;
-        assign.completed = true;
-        saveCategoryAssignments();
-        refreshStates();
-        modal.querySelectorAll('.chest-btn').forEach(b => b.disabled = true);
-        if (!modal.querySelector('.modal-footer')) {
-            const footer = document.createElement('div');
-            footer.className = 'modal-footer';
-            footer.innerHTML = `<button class='primary' data-action='close'>Close</button>`;
-            modal.appendChild(footer);
-            footer.querySelector('[data-action="close"]')?.addEventListener('click', closeModal);
-        }
-    }
-    modal.querySelectorAll('.chest-btn').forEach(btn => btn.addEventListener('click', () => {
-        if (assign.completed)
-            return;
-        const idx = Number(btn.dataset.i);
-        finish(idx === winningIndex);
-    }));
-    backdrop.addEventListener('click', e => { if (e.target === backdrop)
-        closeModal(); });
-    modal.querySelector('.close-btn')?.addEventListener('click', closeModal);
-    backdrop.appendChild(modal);
-    document.body.appendChild(backdrop);
+    });
 }
 function openMoveChainModal(assign, forward) {
     closeModal();
@@ -1605,7 +2566,7 @@ function openMoveChainModal(assign, forward) {
     const modal = document.createElement('div');
     modal.className = 'modal';
     modal.setAttribute('role', 'dialog');
-    modal.innerHTML = `<button class='close-btn' aria-label='Close'>×</button><h2>${forward ? 'Extra Move' : 'Travel Back'}</h2><p>Rolling...</p>
+    modal.innerHTML = `<h2>${forward ? 'Extra Move' : 'Travel Back'}</h2><p>Rolling...</p>
     <div class='move-die' style='font-size:42px;font-weight:700;margin:14px auto;width:84px;height:84px;display:flex;align-items:center;justify-content:center;background:#222;border:3px solid #ff9f43;border-radius:16px;'>-</div>`;
     const die = modal.querySelector('.move-die');
     let ticks = 0;
@@ -1633,4 +2594,764 @@ function openMoveChainModal(assign, forward) {
 }
 // Kick off
 initApp();
+// Initial start_day popup (delay to ensure layout complete)
+setTimeout(() => { maybeApplyTutorialPopups('start_day'); }, 800);
+// Inject shared tutor speech bubble styles once
+function ensureTutorStyles() {
+    if (document.getElementById('tutor-bubble-styles'))
+        return;
+    const style = document.createElement('style');
+    style.id = 'tutor-bubble-styles';
+    style.textContent = `
+  .tutor-modal{background:transparent !important;box-shadow:none !important;padding:0 !important;max-width:none !important;width:100% !important;}
+  :root{--tutor-char-width:340px;--tutor-char-width-mobile:230px;--tutor-char-max-vw:60vw;--tutor-stage-top-shift:100px;--tutor-bubble-max:560px;--tutor-stage-max:600px;--tutor-stage-right-extra:50px;}
+  /* Centered tutorial layout */
+  .tutor-stage{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100dvh;padding: clamp(16px,4vh,40px) clamp(16px,5vw,48px);gap:32px;width:100%;max-width:var(--tutor-stage-max);margin:0 auto; box-sizing:border-box;}
+  .tutor-speech{order:1;position:relative;max-width:var(--tutor-bubble-max);width:100%;margin:0 auto;display:flex;flex-direction:column;}
+  .tutor-speech-inner{background:#1c232b;border:2px solid #ff9f43;border-radius:26px;padding:28px 30px 30px;box-shadow:0 14px 34px rgba(0,0,0,0.6);font-size:15px;line-height:1.6;}
+  .tutor-speech-inner h2{margin:0 0 12px;font-size:22px;}
+  .tutor-text{font-size:15px;}
+  .tutor-actions{margin-top:22px;display:flex;justify-content:flex-end;}
+  /* Arrow removed when centered */
+  .tutor-speech-arrow{display:none;}
+  .tutor-speech-arrow:after{display:none;}
+  .tutor-portrait-wrap{order:2;display:flex;align-items:flex-end;justify-content:center;margin-top:12px;}
+  .tutor-character{width:var(--tutor-char-width);max-width:var(--tutor-char-max-vw);height:auto;filter:drop-shadow(0 10px 18px rgba(0,0,0,.7));transition:transform .45s ease;image-rendering:auto;}
+  .tutor-stage:hover .tutor-character{transform:translateY(4px);} 
+  /* Responsive adjustments */
+  @media (max-width:900px){
+    .tutor-stage{padding: clamp(16px,4vh,34px) clamp(16px,5vw,42px);}
+    .tutor-character{width:calc(var(--tutor-char-width) - 60px);}
+    .tutor-speech-inner{padding:26px 24px 28px;font-size:14px;}
+    .tutor-speech-inner h2{font-size:20px;}
+  }
+  @media (max-width:560px){
+    .tutor-stage{padding: clamp(12px,3vh,30px) 16px;}
+    .tutor-character{width:var(--tutor-char-width-mobile);}
+    .tutor-speech-inner{padding:22px 20px 24px;font-size:13px;}
+    .tutor-speech-inner h2{font-size:19px;}
+  }
+  @media (min-width:1280px){
+    .tutor-stage{min-height:100dvh;}
+    .tutor-character{width:380px;max-width:50vw;}
+  }
+  `;
+    document.head.appendChild(style);
+}
+// ---------------- Day Transition / Advancement ----------------
+function ensureDayFader() {
+    let el = document.getElementById('day-fader');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'day-fader';
+        Object.assign(el.style, { position: 'fixed', left: '0', top: '0', right: '0', bottom: '0', background: '#000', opacity: '0', transition: 'opacity 420ms ease', zIndex: '9998', pointerEvents: 'none' });
+        document.body.appendChild(el);
+    }
+    return el;
+}
+function advanceDayWithTransition() {
+    const fader = ensureDayFader();
+    fader.style.pointerEvents = 'auto';
+    const labelId = 'day-fader-label';
+    let label = document.getElementById(labelId);
+    if (!label) {
+        label = document.createElement('div');
+        label.id = labelId;
+        Object.assign(label.style, { position: 'absolute', left: '50%', top: '50%', transform: 'translate(-50%,-50%)', color: '#fff', fontSize: '48px', fontWeight: '700', fontFamily: 'system-ui, sans-serif', textShadow: '0 4px 12px rgba(0,0,0,0.6)', opacity: '0', transition: 'opacity 500ms ease' });
+        fader.appendChild(label);
+    }
+    requestAnimationFrame(() => { fader.style.opacity = '1'; });
+    // After fade-in completes, increment day, show label for 3s, then fade out.
+    const prevDay = dayState.day;
+    setTimeout(() => {
+        // Legacy streak removed; maintain streakKeys reset if roll not used
+        if (!dayState.rollUsed && streakKeys !== 0) {
+            streakKeys = 0;
+            saveCurrencies();
+        }
+        maybeApplyTutorialPopups('end_day');
+        dayState.day += 1;
+        dayState.rollUsed = false;
+        saveDayState();
+        // If we just moved from final tutorial day (8 -> 9), expand board
+        if (prevDay === 8 && dayState.day === 9) {
+            transitionToMainBoard();
+        }
+        // Reset inline next-day UI: show dice, remove inline button, reset flags
+        dayMinigameCompleted = false;
+        const diceBtn = document.querySelector('.dice-roll-btn');
+        if (diceBtn) {
+            diceBtn.style.display = '';
+        }
+        document.querySelectorAll('.inline-next-day-btn').forEach(el => el.remove());
+        updateDayUI();
+        if (label) {
+            label.textContent = `Day ${dayState.day}`;
+            label.style.opacity = '1';
+        }
+        setTimeout(() => {
+            if (label)
+                label.style.opacity = '0';
+            fader.style.opacity = '0';
+            setTimeout(() => {
+                fader.style.pointerEvents = 'none';
+                // Trigger start_day popups for the new day after fade completes
+                maybeApplyTutorialPopups('start_day');
+            }, 500);
+        }, 3000); // hold 3 seconds
+    }, 500);
+}
+// Expand from tutorial board (1-30) to main board (1-100) and place player at tile 30 start of new journey
+function transitionToMainBoard() {
+    // Increase level cap
+    LEVEL_COUNT = 100;
+    // Place player at tile 30 (end of tutorial trail). Ensure progress saved.
+    progress.current = 30;
+    saveProgress(progress);
+    // Regenerate category & minigame assignments for enlarged board (fresh spread) keeping player position.
+    generateMinigameAssignments(); // will use new LEVEL_COUNT for distribution logic indirectly where needed
+    generateCategoryAssignments();
+    // Rebuild trail visuals with new LEVEL_COUNT
+    positions = generateVerticalPositions(LEVEL_COUNT);
+    height = Math.max(1600, Math.max(...positions.map(p => p.y)) + 400);
+    app.renderer.resize(viewWidth, viewHeight);
+    trailLayer.removeChildren();
+    levelLayer.removeChildren();
+    connectors.splice(0, connectors.length);
+    levelNodes.splice(0, levelNodes.length);
+    buildTrail();
+    createLevels();
+    refreshStates();
+    positionPlayer(progress.current, true);
+    buildBackground();
+    centerCameraOnLevel(progress.current, true);
+    backgroundLayer.y = world.position.y;
+    backgroundLayer.x = 0;
+    updateZoneCrossfade();
+    // Clear any residual tutorial popup scheduling (tutorial functions naturally no-op after day 8)
+    console.log('[Transition] Tutorial complete. Main board activated (levels 1-100, starting at 30).');
+}
+const tutorialPopups = [];
+const shownPlanPopups = new Set();
+// Force replay map: phases we want to ignore prior shown flags for exactly one invocation (clears after use)
+const forceReplayPhases = new Set();
+// Queued forced tutorial minigame (set when a tutorial reward wants a minigame). Launched after pre_minigame popups close.
+let pendingForcedMinigame = null;
+function launchPendingForcedMinigame() {
+    if (!pendingForcedMinigame)
+        return;
+    // Avoid launching over an existing modal (wait for closure).
+    if (document.querySelector('.modal-backdrop'))
+        return;
+    const game = pendingForcedMinigame;
+    pendingForcedMinigame = null;
+    openMinigameModal({ level: progress.current, game, completed: false });
+}
+function queueTutorialPopup(day, phase, html) {
+    tutorialPopups.push({ day, phase, html });
+}
+function maybeApplyTutorialPopups(phase) {
+    if (!isTutorialActive(dayState.day))
+        return false;
+    const day = dayState.day;
+    const collected = [];
+    const forceReplay = forceReplayPhases.has(phase);
+    if (forceReplay) {
+        forceReplayPhases.delete(phase);
+    }
+    // Inline plan popups
+    const plan = getTutorialPlanForDay(day);
+    if (plan && plan.popups && plan.popups[phase]) {
+        const raw = plan.popups[phase];
+        const arr = Array.isArray(raw) ? raw : [raw];
+        arr.forEach(html => {
+            const key = `${day}:${phase}:${html}`;
+            if (forceReplay) {
+                // Push regardless; leave shownPlanPopups as-is (do not re-add to avoid inflating state) but allow re-display
+                collected.push(html);
+                return;
+            }
+            if (!shownPlanPopups.has(key)) {
+                shownPlanPopups.add(key);
+                collected.push(html);
+            }
+        });
+    }
+    // Legacy queued popups
+    const legacy = tutorialPopups.filter(p => p.day === day && p.phase === phase);
+    legacy.forEach(p => collected.push(p.html));
+    if (collected.length === 0)
+        return false;
+    if (collected.length === 1) {
+        openInfoModal('Info', collected[0]);
+        return true;
+    }
+    // Multi-step modal chain
+    openChainedInfoModal(collected);
+    return true;
+}
+function openChainedInfoModal(pages) {
+    closeModal();
+    let index = 0;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.setAttribute('role', 'dialog');
+    const withPortrait = isTutorialActive(dayState.day);
+    if (withPortrait)
+        ensureTutorStyles();
+    if (withPortrait) {
+        modal.classList.add('tutor-modal');
+        backdrop.classList.add('tutor-backdrop');
+        backdrop.classList.add('tutor-backdrop');
+        modal.innerHTML = `<div class='tutor-stage'>
+        <div class='tutor-portrait-wrap'>
+          <img src='${carnivalCharacterUrl}' alt='Guide' class='tutor-character'/>
+        </div>
+        <div class='tutor-speech'>
+          <div class='tutor-speech-arrow'></div>
+          <div class='tutor-speech-inner'>
+            <h2>Tutorial</h2>
+            <div class='tutor-copy'></div>
+            <div class='tutor-actions chain-actions'>
+              <div class='progress-indicator'></div>
+              <div class='nav-btns'>
+                <button class='secondary prev-btn' type='button' style='display:none;'>Back</button>
+                <button class='primary next-btn' type='button'>Next</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+    else {
+        modal.innerHTML = `<h2>Tutorial</h2>
+      <div class='body multi-body'><div class='tutor-copy'></div></div>
+      <div class='modal-footer' style='display:flex;justify-content:space-between;align-items:center;width:100%;'>
+        <div class='progress-indicator' style='font-size:12px;font-weight:600;letter-spacing:.5px;opacity:.75;'></div>
+        <div style='display:flex;gap:8px;'>
+          <button class='secondary prev-btn' type='button' style='display:none;'>Back</button>
+          <button class='primary next-btn' type='button'>Next</button>
+        </div>
+      </div>`;
+    }
+    // Disable outside click dismissal
+    backdrop.addEventListener('click', () => { });
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    const copyRoot = modal.querySelector('.tutor-copy');
+    const nextBtn = modal.querySelector('.next-btn');
+    const prevBtn = modal.querySelector('.prev-btn');
+    const prog = modal.querySelector('.progress-indicator');
+    function render() {
+        if (copyRoot) {
+            copyRoot.innerHTML = pages[index];
+        }
+        else {
+            const body = modal.querySelector('.multi-body');
+            if (body)
+                body.innerHTML = pages[index];
+        }
+        if (prog)
+            prog.textContent = `Step ${index + 1} / ${pages.length}`;
+        if (prevBtn)
+            prevBtn.style.display = index > 0 ? 'inline-block' : 'none';
+        if (nextBtn)
+            nextBtn.textContent = index === pages.length - 1 ? 'Finish' : 'Next';
+    }
+    nextBtn?.addEventListener('click', () => { if (index < pages.length - 1) {
+        index++;
+        render();
+    }
+    else {
+        closeModal();
+    } });
+    prevBtn?.addEventListener('click', () => { if (index > 0) {
+        index--;
+        render();
+    } });
+    render();
+}
+// ---------------- Next Day Overlay Logic ----------------
+// New day completion evaluation replaces overlay & top-right next day button
+let dayMinigameCompleted = false;
+function evaluateDayCompletion() {
+    if (movementInProgress)
+        return; // defer until movement chain fully finished
+    // Conditions: roll used AND (either no forced minigame today OR minigame completed if one was forced)
+    const plan = getTutorialPlanForDay(dayState.day);
+    const needsMinigame = plan && plan.reward.kind === 'minigame' && plan.reward.minigame;
+    if (!dayState.rollUsed)
+        return;
+    if (needsMinigame && !dayMinigameCompleted)
+        return;
+    // If milestone ready and not consumed, show after all other overlays/prompt sequences closed
+    if (tokenDualPopupReady && !tokenDualPopupConsumed) {
+        // Ensure no tutorial or prize star jackpot is pending first
+        if (!document.querySelector('.modal-backdrop')) {
+            if (tokens >= 120) {
+                tokens -= 120;
+                saveTokens();
+                updateTokenCounter();
+            }
+            tokenDualPopupConsumed = true;
+            tokenDualPopupReady = false;
+            openDualThresholdOverlay();
+            return; // wait until user finishes chosen game before continuing day completion
+        }
+    }
+    // Check prize star jackpot before enabling next day if threshold met and not yet played today
+    if (prizeStars >= 5 && !prizeStarJackpotPlayedToday) {
+        // Launch jackpot overlay (defer actual next-day button swap until after overlay)
+        openPrizeStarJackpot();
+        return;
+    }
+    // Swap dice for next-day button if not already swapped
+    const diceBtn = document.querySelector('.dice-roll-btn');
+    if (diceBtn && diceBtn.parentElement) {
+        if (diceBtn.style.display !== 'none') {
+            diceBtn.style.display = 'none';
+            const holder = diceBtn.parentElement;
+            let nextBtn = holder.querySelector('.inline-next-day-btn');
+            if (!nextBtn) {
+                nextBtn = document.createElement('button');
+                nextBtn.type = 'button';
+                nextBtn.className = 'inline-next-day-btn';
+                nextBtn.textContent = 'Next Day';
+                Object.assign(nextBtn.style, { width: '140px', height: '72px', background: '#ff9f43', border: '4px solid #ffcf9a', borderRadius: '18px', fontWeight: '800', fontSize: '18px', cursor: 'pointer', color: '#111', boxShadow: '0 4px 10px rgba(0,0,0,0.45)' });
+                nextBtn.addEventListener('click', () => { advanceDayWithTransition(); });
+                holder.appendChild(nextBtn);
+            }
+        }
+    }
+}
+// Patch updateDayUI to re-run evaluation (restore dice at new day handled in advanceDayWithTransition)
+const originalUpdateDayUI = updateDayUI;
+updateDayUI = function patchedUpdateDayUI() {
+    originalUpdateDayUI();
+    evaluateDayCompletion();
+};
+// Prize Star Jackpot (5/5) -------------------------------------------------
+let prizeStarJackpotPlayedToday = false;
+function openPrizeStarJackpot() {
+    if (prizeStarJackpotPlayedToday)
+        return;
+    prizeStarJackpotPlayedToday = true;
+    // Simple activation shine on progress bar
+    const wrap = document.querySelector('.prize-star-progress');
+    if (wrap) {
+        wrap.classList.add('ps-progress-activating');
+        wrap.animate([
+            { boxShadow: '0 0 0 0 rgba(255,159,67,0.0)' },
+            { boxShadow: '0 0 14px 4px rgba(255,159,67,0.85)' },
+            { boxShadow: '0 0 0 0 rgba(255,159,67,0.0)' }
+        ], { duration: 1400, easing: 'ease' });
+    }
+    setTimeout(() => showPrizeStarJackpotOverlay(), 600);
+}
+function showPrizeStarJackpotOverlay() {
+    closeModal();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop jackpot-backdrop';
+    backdrop.style.backdropFilter = 'blur(4px)';
+    const modal = document.createElement('div');
+    modal.className = 'modal jackpot-modal';
+    modal.style.maxWidth = '640px';
+    modal.style.width = '100%';
+    modal.innerHTML = `<h2 style='text-align:center;margin-bottom:8px;'>Prize Star Bonus Game</h2>
+    <p style='text-align:center;margin:0 0 18px;font-size:14px;line-height:1.5;'>Scratch 3 panels to reveal your guaranteed big reward!</p>
+    <div class='scratch-grid' style='display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 auto 20px;max-width:420px;'></div>
+    <div class='jackpot-result' style='text-align:center;font-weight:600;font-size:16px;min-height:32px;'></div>
+    <div class='modal-footer' style='justify-content:center;'><button class='primary jackpot-close' type='button' disabled>Close</button></div>`;
+    const grid = modal.querySelector('.scratch-grid');
+    const resultEl = modal.querySelector('.jackpot-result');
+    const closeBtn = modal.querySelector('.jackpot-close');
+    const rewards = [
+        { kind: 'freePlays', amount: 10, label: '10 Free Plays' },
+        { kind: 'bonus', amount: 1000, label: '£10 Bonus Money' },
+        { kind: 'cash', amount: 500, label: '£5 Cash' }
+    ];
+    // For now guarantee all 3 unique then randomly pick one final reveal sequence (player always "wins")
+    const revealPool = [...rewards];
+    const panelCount = 9;
+    let revealed = 0;
+    let chosenReward = null;
+    for (let i = 0; i < panelCount; i++) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'scratch-panel';
+        Object.assign(btn.style, {
+            position: 'relative', height: '90px', background: '#222', border: '2px solid #555', borderRadius: '12px', cursor: 'pointer', fontWeight: '700', color: '#ffcf9a', fontSize: '15px', letterSpacing: '.5px', display: 'flex', alignItems: 'center', justifyContent: 'center'
+        });
+        btn.textContent = 'SCRATCH';
+        btn.addEventListener('click', () => {
+            if (btn.dataset.revealed === '1')
+                return;
+            btn.dataset.revealed = '1';
+            revealed++;
+            // Assign a reward symbol (cycle through revealPool first 3 picks, then repeat one of them)
+            if (!chosenReward) {
+                // First three picks: assign unique rewards
+                if (revealed <= 3) {
+                    const r = revealPool.shift(); // guaranteed
+                    btn.textContent = r.label;
+                    if (revealed === 3) {
+                        // Choose one of the revealed rewards as final prize
+                        chosenReward = r; // deterministic last one picked acts as prize (simplify)
+                        finalizeJackpotReward(chosenReward, resultEl, closeBtn);
+                    }
+                }
+                else {
+                    btn.textContent = '—';
+                }
+            }
+            else {
+                btn.textContent = chosenReward.label;
+            }
+            btn.style.background = '#333';
+            btn.style.borderColor = '#ff9f43';
+        });
+        grid.appendChild(btn);
+    }
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    closeBtn.addEventListener('click', () => {
+        if (closeBtn.disabled)
+            return;
+        // Reset prize stars back to zero after awarding
+        prizeStars = 0;
+        saveCurrencies();
+        updateCurrencyCounters();
+        closeModal(); // remove jackpot modal
+        evaluateDayCompletion(); // continue normal flow (next-day button etc.)
+    });
+}
+function finalizeJackpotReward(r, resultEl, closeBtn) {
+    // Apply the reward (guaranteed win) and show message
+    applyReward(r);
+    resultEl.innerHTML = `<p><strong>Congrats!</strong> You won ${r.label}!</p>`;
+    closeBtn.disabled = false;
+}
+// ================= 120 Token Dual Choice Overlay & Games =================
+function openDualThresholdOverlay() {
+    ensureDualStyles();
+    if (document.querySelector('.modal-backdrop'))
+        return;
+    closeModal();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop dual-choice-backdrop';
+    const wrap = document.createElement('div');
+    wrap.className = 'dual-choice-wrap';
+    wrap.innerHTML = `
+    <div class='dual-choice-header'>
+      <h1>Milestone Unlocked!</h1>
+      <p>You reached 120 Tokens. Choose ONE premium bonus game.</p>
+    </div>
+    <div class='dual-choice-inner'>
+      <div class='choice left-choice' tabindex='0'>
+        <div class='dual-choice-badges'><span class='dual-choice-badge'>Guaranteed Win</span><span class='dual-choice-badge'>High Value</span></div>
+        <h2>Scratch Jackpot</h2>
+        <p>Scratch 3 premium panels. One high-tier reward is yours—no duds.</p>
+        <button type='button' class='primary play-left'>Play Scratch</button>
+      </div>
+      <div class='choice right-choice' tabindex='0'>
+        <div class='dual-choice-badges'><span class='dual-choice-badge'>Tension Build</span><span class='dual-choice-badge'>Big Range</span></div>
+        <h2>Mega Box Pick</h2>
+        <p>Keep one box, eliminate the rest, then decide: stay or switch at the end.</p>
+        <button type='button' class='primary play-right'>Play Mega Box</button>
+      </div>
+    </div>`;
+    backdrop.appendChild(wrap);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    const toScratch = () => { closeModal(); openSpecialScratchJackpotOverlay(); };
+    const toMega = () => { closeModal(); openMegaBoxGameOverlay(); };
+    wrap.querySelector('.play-left')?.addEventListener('click', toScratch);
+    wrap.querySelector('.play-right')?.addEventListener('click', toMega);
+    const leftChoice = wrap.querySelector('.left-choice');
+    const rightChoice = wrap.querySelector('.right-choice');
+    if (leftChoice) {
+        leftChoice.addEventListener('keydown', (e) => { const k = e.key || e.code; if (k === 'Enter' || k === ' ') {
+            e.preventDefault();
+            toScratch();
+        } });
+    }
+    if (rightChoice) {
+        rightChoice.addEventListener('keydown', (e) => { const k = e.key || e.code; if (k === 'Enter' || k === ' ') {
+            e.preventDefault();
+            toMega();
+        } });
+    }
+    leftChoice?.focus();
+}
+function ensureDualStyles() {
+    let style = document.getElementById('dual-choice-styles');
+    if (!style) {
+        style = document.createElement('style');
+        style.id = 'dual-choice-styles';
+        document.head.appendChild(style);
+    }
+    style.textContent = `
+  .dual-choice-backdrop{backdrop-filter:blur(6px);}
+  .dual-choice-wrap{width:100%;max-width:1000px;display:flex;flex-direction:column;align-items:stretch;padding:28px 26px 34px;gap:26px;}
+  .dual-choice-header{text-align:center;}
+  .dual-choice-header h1{margin:0 0 8px;font-size:30px;background:linear-gradient(90deg,#ffb25b,#ff6d3b);-webkit-background-clip:text;color:transparent;letter-spacing:1px;font-weight:800;}
+  .dual-choice-header p{margin:0;font-size:15px;opacity:.85;letter-spacing:.5px;}
+  .dual-choice-inner{display:flex;gap:34px;flex-wrap:wrap;justify-content:center;width:100%;}
+  .dual-choice-inner .choice{position:relative;flex:1 1 360px;max-width:440px;background:linear-gradient(155deg,#111b23,#0c1217 60%,#181f26);border:2px solid rgba(255,159,67,0.65);border-radius:26px;padding:26px 28px 28px;display:flex;flex-direction:column;gap:14px;box-shadow:0 18px 40px -14px rgba(0,0,0,0.75),0 0 0 1px rgba(255,159,67,0.15);overflow:hidden;}
+  .dual-choice-inner .choice:before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 28% 18%,rgba(255,159,67,0.18),transparent 60%);pointer-events:none;}
+  .dual-choice-inner .choice h2{margin:0 0 4px;font-size:24px;letter-spacing:.5px;}
+  .dual-choice-inner .choice p{margin:0 0 10px;font-size:15px;line-height:1.55;opacity:.9;}
+  .dual-choice-inner .choice button{align-self:flex-start;transition:transform .18s ease,background .2s;}
+  .dual-choice-inner .choice:hover{border-color:#ffbc6e;box-shadow:0 18px 42px -14px rgba(0,0,0,0.8),0 0 0 1px rgba(255,188,110,0.35);}
+  .dual-choice-inner .choice:hover button{transform:translateY(-2px);}
+  .dual-choice-badges{display:flex;gap:10px;flex-wrap:wrap;}
+  .dual-choice-badge{background:#1f2d36;padding:4px 10px;border-radius:30px;font-size:11px;letter-spacing:.7px;font-weight:600;text-transform:uppercase;border:1px solid #314149;color:#ffb56a;}
+  @media(max-width:760px){ .dual-choice-inner{flex-direction:column;} .dual-choice-header h1{font-size:24px;} }
+  .special-scratch{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;max-width:420px;margin:0 auto 20px;}
+  .special-scratch button{position:relative;height:90px;background:#222;border:2px solid #555;border-radius:14px;cursor:pointer;font-weight:700;color:#ffcf9a;font-size:15px;letter-spacing:.5px;display:flex;align-items:center;justify-content:center;transition:background .2s,border-color .2s,transform .18s;}
+  .special-scratch button:not(.revealed):hover{background:#2b2b2b;transform:translateY(-3px);} 
+  .special-scratch button.revealed{background:#333;border-color:#ff9f43;}
+  .mega-box-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;max-width:640px;margin:0 auto 16px;}
+  .mega-box-grid button{height:86px;background:#1b2228;border:2px solid #3a4550;border-radius:12px;color:#fff;font-weight:600;cursor:pointer;letter-spacing:.5px;font-size:14px;position:relative;transition:background .18s,border-color .18s,transform .18s;}
+  .mega-box-grid button:not(.opened):hover{background:#25323a;transform:translateY(-3px);} 
+  .mega-box-grid button.kept{outline:3px solid #ff9f43;}
+  .mega-box-grid button.eliminated{background:#101417;border-color:#222;color:#555;}
+  .mega-box-grid button.final{animation:pulseFinal 1.4s ease-in-out infinite alternate;}
+  @keyframes pulseFinal{0%{box-shadow:0 0 0 0 rgba(255,159,67,0.4);}100%{box-shadow:0 0 0 6px rgba(255,159,67,0.0);} }
+  .mega-status{min-height:52px;text-align:center;font-size:15px;font-weight:600;letter-spacing:.5px;}
+  .mega-decisions{display:flex;justify-content:center;gap:18px;margin:6px 0 10px;}
+  .mega-decisions button{min-width:140px;}
+  .mega-close-row{display:flex;justify-content:center;margin-top:8px;}
+  .mega-close-row button{min-width:160px;}
+  `;
+}
+function openSpecialScratchJackpotOverlay() {
+    ensureDualStyles();
+    closeModal();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.maxWidth = '680px';
+    modal.innerHTML = `<h2 style='text-align:center;margin:0 0 10px;'>Grand Scratch Bonus</h2>
+    <p style='text-align:center;margin:0 0 16px;font-size:14px;'>Scratch any 3 panels. One of the displayed rewards will be yours!</p>
+    <div class='special-scratch'></div>
+    <div class='jackpot-result' style='text-align:center;font-weight:600;font-size:16px;min-height:34px;'></div>
+    <div class='modal-footer' style='justify-content:center;'><button class='primary close-special' type='button' disabled>Close</button></div>`;
+    const grid = modal.querySelector('.special-scratch');
+    const resultEl = modal.querySelector('.jackpot-result');
+    const closeBtn = modal.querySelector('.close-special');
+    const rewards = [
+        { kind: 'freePlays', amount: 15, label: '15 Free Plays' },
+        { kind: 'bonus', amount: 1500, label: '£15 Bonus Money' },
+        { kind: 'cash', amount: 1000, label: '£10 Cash' }
+    ];
+    let revealed = 0;
+    let finalReward = null;
+    for (let i = 0; i < 9; i++) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'SCRATCH';
+        btn.addEventListener('click', () => {
+            if (btn.classList.contains('revealed'))
+                return;
+            revealed++;
+            if (revealed <= 3) {
+                const pick = rewards[revealed - 1];
+                btn.textContent = pick.label;
+                finalReward = pick;
+                btn.classList.add('revealed');
+                if (revealed === 3 && finalReward) {
+                    applyReward(finalReward);
+                    resultEl.innerHTML = `<p><strong>You won ${finalReward.label}!</strong></p>`;
+                    closeBtn.disabled = false;
+                }
+            }
+            else {
+                btn.textContent = '—';
+                btn.classList.add('revealed');
+            }
+        });
+        grid.appendChild(btn);
+    }
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    closeBtn.addEventListener('click', () => { if (!closeBtn.disabled)
+        closeModal(); });
+}
+function openMegaBoxGameOverlay() {
+    ensureDualStyles();
+    closeModal();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.style.maxWidth = '860px';
+    modal.innerHTML = `<button class='close-x' aria-label='Close' style='position:absolute;top:10px;right:10px;background:#222;border:1px solid #444;color:#fff;border-radius:50%;width:34px;height:34px;font-size:16px;cursor:pointer;'>&times;</button>
+    <h2 style='text-align:center;margin:0 0 10px;'>Mega Box Pick</h2>
+    <p style='text-align:center;margin:0 0 14px;font-size:14px;'>Pick a box to keep. Eliminate the rest. When only one other box remains, decide to <strong>Keep</strong> or <strong>Switch</strong>. The unchosen final box will always be Nothing.</p>
+    <div class='mega-box-grid'></div>
+    <div class='mega-status'></div>
+    <div class='mega-decisions' style='display:none;'>
+      <button type='button' class='primary keep-choice' disabled>Keep My Box</button>
+      <button type='button' class='secondary switch-choice' disabled>Switch Boxes</button>
+    </div>
+    <div class='mega-close-row' style='display:none;'>
+      <button type='button' class='primary close-mega'>Close</button>
+    </div>`;
+    const grid = modal.querySelector('.mega-box-grid');
+    const statusEl = modal.querySelector('.mega-status');
+    const keepBtn = modal.querySelector('.keep-choice');
+    const switchBtn = modal.querySelector('.switch-choice');
+    const decisionsRow = modal.querySelector('.mega-decisions');
+    const closeRow = modal.querySelector('.mega-close-row');
+    const closeBtnTop = modal.querySelector('.close-x');
+    const closeBtnBottom = modal.querySelector('.close-mega');
+    closeBtnTop.addEventListener('click', closeModal);
+    closeBtnBottom.addEventListener('click', closeModal);
+    const rewardPool = [
+        { kind: 'cash', amount: 2000, label: '£20 Cash' },
+        { kind: 'bonus', amount: 2500, label: '£25 Bonus' },
+        { kind: 'freePlays', amount: 20, label: '20 Free Plays' },
+        { kind: 'cash', amount: 1000, label: '£10 Cash' },
+        { kind: 'bonus', amount: 1500, label: '£15 Bonus' },
+        { kind: 'freePlays', amount: 10, label: '10 Free Plays' },
+        { kind: 'tokens', amount: 200, label: '200 Tokens' },
+        { kind: 'bonus', amount: 500, label: '£5 Bonus' },
+        { kind: 'cash', amount: 500, label: '£5 Cash' },
+        { kind: 'freePlays', amount: 5, label: '5 Free Plays' },
+        { kind: 'tokens', amount: 100, label: '100 Tokens' },
+        { kind: 'bonus', amount: 1000, label: '£10 Bonus' }
+    ];
+    for (let i = rewardPool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [rewardPool[i], rewardPool[j]] = [rewardPool[j], rewardPool[i]];
+    }
+    const boxes = rewardPool.map((r, i) => { const el = document.createElement('button'); el.type = 'button'; el.textContent = String(i + 1); grid.appendChild(el); return { idx: i, reward: r, el }; });
+    let keptBox = null;
+    let finalContender = null;
+    let finished = false;
+    function updateStatus(msg) { statusEl.innerHTML = `<p>${msg}</p>`; }
+    updateStatus('Select a box to keep.');
+    boxes.forEach(b => {
+        b.el.addEventListener('click', () => {
+            if (finished)
+                return;
+            if (!keptBox) {
+                keptBox = b;
+                b.kept = true;
+                b.el.classList.add('kept');
+                updateStatus('Now open every other box.');
+                return;
+            }
+            if (b === keptBox || b.opened)
+                return;
+            b.opened = true;
+            b.el.classList.add('eliminated');
+            b.el.textContent = b.reward.label;
+            b.el.classList.add('opened');
+            const remaining = boxes.filter(x => !x.opened && x !== keptBox);
+            if (remaining.length === 1) {
+                finalContender = remaining[0];
+                finalContender.el.classList.add('final');
+                keptBox.el.classList.add('final');
+                updateStatus('Final decision: Keep your box or Switch?');
+                decisionsRow.style.display = 'flex';
+                keepBtn.disabled = false;
+                switchBtn.disabled = false;
+                keepBtn.focus();
+            }
+        });
+    });
+    function conclude(playerBox, otherBox) {
+        if (finished)
+            return;
+        finished = true;
+        applyReward(playerBox.reward);
+        playerBox.el.textContent = playerBox.reward.label + ' (Won)';
+        otherBox.el.textContent = 'Nothing';
+        otherBox.el.classList.add('eliminated');
+        // Outline handling: ensure only winning (kept) box shows kept outline
+        boxes.forEach(b => b.el.classList.remove('kept'));
+        playerBox.el.classList.add('kept');
+        otherBox.el.classList.remove('kept');
+        updateStatus(`<strong>You won ${playerBox.reward.label}!</strong>`);
+        decisionsRow.style.display = 'none';
+        closeRow.style.display = 'flex';
+        closeBtnBottom.focus();
+    }
+    keepBtn.addEventListener('click', () => { if (!keptBox || !finalContender)
+        return; conclude(keptBox, finalContender); });
+    switchBtn.addEventListener('click', () => { if (!keptBox || !finalContender)
+        return; conclude(finalContender, keptBox); });
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+}
+function maybeApplyTutorialReward(triggerPhase) {
+    if (!isTutorialActive(dayState.day))
+        return;
+    const plan = getTutorialPlanForDay(dayState.day);
+    if (!plan)
+        return;
+    const flagKey = `tutorialRewardApplied_${plan.day}`;
+    if (window[flagKey])
+        return;
+    if (triggerPhase === 'post_move') {
+        applyTutorialReward(plan);
+        window[flagKey] = true;
+        if (plan.reward.kind === 'minigame' && plan.reward.minigame) {
+            // Queue minigame and show pre_minigame popups first. After user closes them, we auto-launch.
+            pendingForcedMinigame = plan.reward.minigame;
+            setTimeout(() => {
+                // We no longer show pre_minigame BEFORE the minigame; launch directly and overlay instructions inside the modal.
+                launchPendingForcedMinigame();
+            }, 450);
+        }
+    }
+    if (triggerPhase === 'post_minigame') {
+        // Placeholder for future phases
+    }
+}
+function applyTutorialReward(plan) {
+    const r = plan.reward;
+    switch (r.kind) {
+        case 'tokens':
+            if (r.amount)
+                addTokens(r.amount);
+            break;
+        case 'prize': {
+            // Placeholder: map prizeId to 1 free play unless amount provided
+            if (r.amount)
+                addFreePlays(r.amount);
+            else if (r.prizeId) {
+                addFreePlays(1);
+            }
+            break;
+        }
+        case 'freePlays':
+            if (r.amount) {
+                addFreePlays(r.amount);
+            }
+            break;
+        case 'streak_boost':
+            if (r.amount) {
+                addPrizeStars(Math.min(5, r.amount));
+            }
+            break;
+        case 'nothing':
+        default: break;
+        case 'minigame': break; // minigame opened separately
+    }
+}
+// Seed some tutorial popups (can be expanded or replaced later)
+// queueTutorialPopup(1,'pre_roll',"<p>Welcome! Let's start your journey. Tap the dice to move.</p>");
+// queueTutorialPopup(1,'post_move',"<p>Great! You earned some starter tokens.</p>");
+// queueTutorialPopup(4,'pre_minigame',"<p>Your first minigame! Try it out.</p>");
+// queueTutorialPopup(8,'end_day',"<p>Tutorial complete! Jungle zone unlocks tomorrow.</p>");
 //# sourceMappingURL=main.js.map

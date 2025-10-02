@@ -4,6 +4,10 @@ import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
 import carnivalBackgroundUrl from '../assets/carnival/carnival_background.png';
 import tokenIconUrl from '../assets/general/token.svg';
 import carnivalCharacterUrl from '../assets/carnival/carnival_character.png';
+import bonusMoneyIconUrl from '../assets/general/BM.png';
+import freePlaysIconUrl from '../assets/general/FP.png';
+import streakKeyIconUrl from '../assets/general/key.png';
+import prizeStarIconUrl from '../assets/general/star.png';
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards
  - Only ~8 levels visible via camera window height
@@ -1133,16 +1137,16 @@ function renderControls() {
           <div class="currency level-counter pill" title="Player Level"><span class="label">Lvl</span><span class="level-count">1</span></div>
           <div class="prize-star-progress" title="Prize Star Progress" aria-label="Prize Star Progress">
             <div class="ps-progress-bar"><div class="ps-progress-fill"></div></div>
-            <div class="ps-progress-label"><span class="ps-progress-count">0</span>/5 ⭐</div>
+            <div class="ps-progress-label"><span class="ps-progress-count">0</span>/5 <img src="${prizeStarIconUrl}" alt="Prize Star" class="currency-icon star-icon" /></div>
           </div>
         </div>
         <div class="currency-group-card" aria-label="Reward Currencies">
+          <div class="currency bonus-counter pill" title="Bonus Money"><img src="${bonusMoneyIconUrl}" alt="Bonus Money" class="currency-icon bonus-icon" /><span class="bonus-count">0</span></div>
+          <div class="currency fp-counter pill" title="Free Plays"><img src="${freePlaysIconUrl}" alt="Free Plays" class="currency-icon fp-icon" /><span class="fp-count">0</span></div>
+          <div class="currency sk-counter pill" title="Streak Keys"><img src="${streakKeyIconUrl}" alt="Streak Key" class="currency-icon key-icon" /><span class="sk-count">0</span></div>
+          <div class="currency ps-counter pill" title="Prize Stars"><img src="${prizeStarIconUrl}" alt="Prize Star" class="currency-icon star-icon" /><span class="ps-count">0</span></div>
           <div class="currency token-counter pill"><img src="${tokenIconUrl}" alt="Token" class="token-icon" /><span class="token-count">0</span></div>
-          <div class="currency fp-counter pill" title="Free Plays"><span class="label">FP</span><span class="fp-count">0</span></div>
           <div class="currency cash-counter pill" title="Cash Balance"><span class="label">💰</span><span class="cash-count">0</span></div>
-          <div class="currency bonus-counter pill" title="Bonus Money"><span class="label">BM</span><span class="bonus-count">0</span></div>
-          <div class="currency sk-counter pill" title="Streak Keys"><span class="label">🔑</span><span class="sk-count">0</span></div>
-          <div class="currency ps-counter pill" title="Prize Stars"><span class="label">⭐</span><span class="ps-count">0</span></div>
         </div>
       </div>
       <div class="control-row" style="display:flex;gap:8px;margin-top:10px;">
@@ -1174,6 +1178,7 @@ function renderControls() {
         .currency-bar .pill .label{opacity:0.85;font-size:12px;letter-spacing:.5px;} 
         .currency-bar .cash-counter .label{font-size:15px;line-height:1;} 
     .currency-bar img.token-icon{width:18px;height:18px;display:block;}
+    .currency-bar img.currency-icon{width:18px;height:18px;display:block;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6));}
     .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
   .prize-star-progress{position:relative;display:flex;flex-direction:column;padding:6px 8px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:150px;}
   .ps-progress-bar{position:relative;width:100%;height:24px;background:#1f262d;border:1px solid #36424d;border-radius:10px;overflow:hidden;display:flex;align-items:center;}

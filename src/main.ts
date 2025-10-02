@@ -61,6 +61,8 @@ const CATEGORY_ASSIGN_KEY = 'categoryAssignmentsV1';
 const DAY_STATE_KEY = 'dayStateV1';
 const STREAK_STATE_KEY = 'streakStateV1'; // legacy key retained for migration
 const LEVEL_STATE_KEY = 'levelStateV1';
+const DUAL_CHOICE_MILESTONE_KEY = 'dualChoiceMilestoneConsumedV1';
+const PRIZE_STAR_MILESTONE_KEY = 'prizeStarMilestoneCycleV1';
 
 interface DayState { day: number; rollUsed: boolean }
 let dayState: DayState = { day: 1, rollUsed: false };
@@ -386,12 +388,23 @@ function saveTokens() { localStorage.setItem(TOKEN_STORAGE_KEY, String(tokens));
 // Dual-choice milestone flags
 let tokenDualPopupReady = false; // becomes true once threshold crossed
 let tokenDualPopupConsumed = false; // set true once popup opened & tokens deducted
+// Milestone persistence helpers
+function isTutorialComplete(): boolean { return dayState.day > 8; }
+function loadDualChoiceConsumed(): boolean { return localStorage.getItem(DUAL_CHOICE_MILESTONE_KEY) === '1'; }
+function markDualChoiceConsumed(){ localStorage.setItem(DUAL_CHOICE_MILESTONE_KEY,'1'); }
+function loadPrizeStarCycle(): number { const raw = localStorage.getItem(PRIZE_STAR_MILESTONE_KEY); if(!raw) return 0; const n = parseInt(raw,10); return isNaN(n)?0:n; }
+function setPrizeStarCycle(n:number){ localStorage.setItem(PRIZE_STAR_MILESTONE_KEY,String(n)); }
+let dualChoiceAlreadyConsumed = loadDualChoiceConsumed();
+let prizeStarCycleCount = loadPrizeStarCycle();
 function addTokens(n:number){
   if(n>0){
     const prev = tokens;
     tokens+=n; saveTokens(); updateTokenCounter();
     if(!tokenDualPopupConsumed && prev < 120 && tokens >= 120){
-      tokenDualPopupReady = true; // will be shown end-of-day
+      // Allow during tutorial or once post-tutorial if not already consumed.
+      if(!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed)){
+        tokenDualPopupReady = true; // will be shown end-of-day
+      }
     }
   }
 }
@@ -2380,6 +2393,7 @@ function evaluateDayCompletion(){
     if(!document.querySelector('.modal-backdrop')){
       if(tokens >= 120){ tokens -= 120; saveTokens(); updateTokenCounter(); }
       tokenDualPopupConsumed = true; tokenDualPopupReady = false;
+      if(isTutorialComplete() && !dualChoiceAlreadyConsumed){ dualChoiceAlreadyConsumed = true; markDualChoiceConsumed(); }
       openDualThresholdOverlay();
       return; // wait until user finishes chosen game before continuing day completion
     }
@@ -2421,6 +2435,7 @@ let prizeStarJackpotPlayedToday = false;
 function openPrizeStarJackpot(){
   if(prizeStarJackpotPlayedToday) return;
   prizeStarJackpotPlayedToday = true;
+  if(isTutorialComplete()){ prizeStarCycleCount++; setPrizeStarCycle(prizeStarCycleCount); }
   // Simple activation shine on progress bar
   const wrap = document.querySelector('.prize-star-progress');
   if(wrap){

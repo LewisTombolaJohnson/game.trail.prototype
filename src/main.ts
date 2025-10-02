@@ -1035,6 +1035,11 @@ function renderControls() {
   .prize-star-progress{position:relative;display:flex;flex-direction:column;padding:6px 8px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:150px;}
   .ps-progress-bar{position:relative;width:100%;height:24px;background:#1f262d;border:1px solid #36424d;border-radius:10px;overflow:hidden;display:flex;align-items:center;}
   .ps-progress-fill{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.6) inset,0 0 4px rgba(255,159,67,0.55);transition:width .6s cubic-bezier(.4,.8,.2,1),filter .5s;}
+  /* Level-up glow flash after jackpot */
+  .prize-star-progress.ps-level-up .ps-progress-fill{animation:psLevelUpFlash 1.6s ease forwards;}
+  @keyframes psLevelUpFlash{0%{filter:drop-shadow(0 0 0px #ff9f43) brightness(1);}40%{filter:drop-shadow(0 0 10px #ffcd8a) brightness(1.3);}70%{filter:drop-shadow(0 0 5px #ff9f43) brightness(1.1);}100%{filter:drop-shadow(0 0 0px #ff9f43) brightness(1);} }
+  .prize-star-progress.ps-level-up{box-shadow:0 0 0 0 rgba(255,159,67,0.0),0 0 0 2px rgba(255,159,67,0.4);animation:psOuterPulse 1.6s ease forwards;}
+  @keyframes psOuterPulse{0%{box-shadow:0 0 0 0 rgba(255,159,67,0.0),0 0 0 2px rgba(255,159,67,0.0);}35%{box-shadow:0 0 18px 6px rgba(255,159,67,0.55),0 0 0 2px rgba(255,159,67,0.65);}100%{box-shadow:0 0 0 0 rgba(255,159,67,0.0),0 0 0 2px rgba(255,159,67,0.15);} }
   /* Adjust vertical nudge of label here via translateY */
   .ps-progress-label{pointer-events:none;position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;letter-spacing:.6px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.9),0 0 4px rgba(0,0,0,0.55);transform:translateY(-1px);} 
   .prize-star-progress .ps-progress-label .ps-progress-count{margin-right:4px;}
@@ -2536,6 +2541,20 @@ function showPrizeStarJackpotOverlay(){
     if(closeBtn.disabled) return;
     // Reset prize stars back to zero after awarding
     prizeStars = 0; saveCurrencies(); updateCurrencyCounters();
+    // Level up player once when completing jackpot (clamp to LEVEL_COUNT)
+    if(levelState.level < LEVEL_COUNT){
+      levelState.level += 1; saveLevelState(); updateLevelUI();
+    }
+    // Visual glow on progress bar to show level gain triggered from jackpot
+    try {
+      const bar = document.querySelector('.prize-star-progress');
+      if(bar){
+        bar.classList.remove('ps-level-up'); // reset if still applied
+        void (bar as HTMLElement).offsetWidth; // force reflow for restart
+        bar.classList.add('ps-level-up');
+        setTimeout(()=> bar.classList.remove('ps-level-up'), 1800);
+      }
+    } catch(e){ /* non-fatal */ }
     closeModal(); // remove jackpot modal
     evaluateDayCompletion(); // continue normal flow (next-day button etc.)
   });

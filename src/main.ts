@@ -217,7 +217,25 @@ function addFreePlays(n:number){ if(n>0){ freePlays+=n; saveCurrencies(); update
 function addCashPence(n:number){ if(n>0){ cashPence+=n; saveCurrencies(); updateCurrencyCounters(); } }
 function addBonusPence(n:number){ if(n>0){ bonusPence+=n; saveCurrencies(); updateCurrencyCounters(); } }
 function addStreakKeys(n:number){ if(n>0){ streakKeys+=n; saveCurrencies(); updateCurrencyCounters(); } }
-function addPrizeStars(n:number){ if(n>0){ prizeStars+=n; saveCurrencies(); updateCurrencyCounters(); } }
+function addPrizeStars(n:number){
+  if(n>0){
+    prizeStars+=n; saveCurrencies(); updateCurrencyCounters();
+    // After tutorial, allow jackpot to trigger immediately when reaching 5/5 mid-day
+    try {
+      if(isTutorialComplete && typeof isTutorialComplete==='function' && isTutorialComplete()){
+        if(prizeStars >=5){
+          // If a modal is open we'll rely on closeModal -> ensurePrizeStarJackpotAfterTutorials;
+          // otherwise attempt immediate trigger.
+          if(!document.querySelector('.modal-backdrop')){
+            if(typeof prizeStarJackpotPlayedToday !== 'undefined' && !prizeStarJackpotPlayedToday){
+              openPrizeStarJackpot();
+            }
+          }
+        }
+      }
+    } catch(e){ /* non-fatal */ }
+  }
+}
 
 // Minigame assignments
 let minigameAssignments: MinigameAssignment[] = [];
@@ -2210,6 +2228,8 @@ function advanceDayWithTransition(){
     if(!dayState.rollUsed && streakKeys !== 0){ streakKeys = 0; saveCurrencies(); }
     maybeApplyTutorialPopups('end_day');
   dayState.day += 1; dayState.rollUsed = false; saveDayState();
+  // Reset per-day jackpot flag so a new 5/5 can trigger today (post-tutorial cycle)
+  if(typeof prizeStarJackpotPlayedToday !== 'undefined') prizeStarJackpotPlayedToday = false;
   // If we just moved from final tutorial day (8 -> 9), expand board
   if(prevDay === 8 && dayState.day === 9){
     transitionToMainBoard();

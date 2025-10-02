@@ -418,10 +418,22 @@ function addTokens(n:number){
   if(n>0){
     const prev = tokens;
     tokens+=n; saveTokens(); updateTokenCounter();
-    if(!tokenDualPopupConsumed && prev < 120 && tokens >= 120){
-      // Allow during tutorial or once post-tutorial if not already consumed.
-      if(!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed)){
-        tokenDualPopupReady = true; // will be shown end-of-day
+    if(!tokenDualPopupConsumed){
+      // If threshold newly crossed this add, or we were already above but milestone not yet fired (e.g. saved state >120)
+      const thresholdCrossed = prev < 120 && tokens >= 120;
+      const alreadyBeyondButUnclaimed = prev >= 120 && tokens >= 120 && !tokenDualPopupReady && !dualChoiceAlreadyConsumed;
+      if(thresholdCrossed || alreadyBeyondButUnclaimed){
+        if(!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed)){
+          tokenDualPopupReady = true;
+          // Attempt immediate opening if no modal and day conditions otherwise not blocking
+          if(!document.querySelector('.modal-backdrop')){
+            // Deduct now and open directly instead of waiting for end-of-day
+            if(tokens >= 120){ tokens -= 120; saveTokens(); updateTokenCounter(); }
+            tokenDualPopupConsumed = true; tokenDualPopupReady = false;
+            if(isTutorialComplete() && !dualChoiceAlreadyConsumed){ dualChoiceAlreadyConsumed = true; markDualChoiceConsumed(); }
+            openDualThresholdOverlay();
+          }
+        }
       }
     }
   }
@@ -468,6 +480,19 @@ async function initApp() {
   enableFreeScroll(rootEl);
   renderDice();
   refreshStates();
+  // If player already exceeds token milestone and hasn't consumed it post-tutorial, trigger immediately
+  try {
+    if(tokens >= 120 && !tokenDualPopupConsumed){
+      if(!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed)){
+        if(tokens >= 120){
+          tokens -= 120; saveTokens(); updateTokenCounter();
+        }
+        tokenDualPopupConsumed = true; tokenDualPopupReady = false;
+        if(isTutorialComplete() && !dualChoiceAlreadyConsumed){ dualChoiceAlreadyConsumed = true; markDualChoiceConsumed(); }
+        openDualThresholdOverlay();
+      }
+    }
+  } catch(e){ /* non-fatal */ }
   centerCameraOnLevel(progress.current, true);
 }
 

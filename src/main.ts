@@ -406,6 +406,29 @@ function saveTokens() { localStorage.setItem(TOKEN_STORAGE_KEY, String(tokens));
 // Dual-choice milestone flags
 let tokenDualPopupReady = false; // becomes true once threshold crossed
 let tokenDualPopupConsumed = false; // set true once popup opened & tokens deducted
+// Resilient watcher for dual-choice milestone (ensures we don't miss showing it)
+let dualChoiceWatcher: number | null = null;
+function attemptDualChoiceTrigger(){
+  if(tokenDualPopupConsumed) return; // already used
+  // Only eligible if threshold met or exceeded and not previously consumed (post-tutorial) or still tutorial
+  if(tokens < 120) return;
+  if(isTutorialComplete() && dualChoiceAlreadyConsumed) return;
+  // Don't open over existing modal to avoid stacking; we'll retry
+  if(document.querySelector('.modal-backdrop')) return;
+  // Deduct and open
+  if(tokens >= 120){ tokens -= 120; saveTokens(); updateTokenCounter(); }
+  tokenDualPopupConsumed = true; tokenDualPopupReady = false;
+  if(isTutorialComplete() && !dualChoiceAlreadyConsumed){ dualChoiceAlreadyConsumed = true; markDualChoiceConsumed(); }
+  openDualThresholdOverlay();
+  stopDualChoiceWatcher();
+}
+function startDualChoiceWatcher(){
+  if(dualChoiceWatcher!==null) return; // already running
+  dualChoiceWatcher = window.setInterval(()=>{
+    try { attemptDualChoiceTrigger(); } catch(e){ /* ignore */ }
+  }, 800); // every 0.8s
+}
+function stopDualChoiceWatcher(){ if(dualChoiceWatcher!==null){ clearInterval(dualChoiceWatcher); dualChoiceWatcher = null; } }
 // Milestone persistence helpers
 function isTutorialComplete(): boolean { return dayState.day > 8; }
 function loadDualChoiceConsumed(): boolean { return localStorage.getItem(DUAL_CHOICE_MILESTONE_KEY) === '1'; }
@@ -419,21 +442,11 @@ function addTokens(n:number){
     const prev = tokens;
     tokens+=n; saveTokens(); updateTokenCounter();
     if(!tokenDualPopupConsumed){
-      // If threshold newly crossed this add, or we were already above but milestone not yet fired (e.g. saved state >120)
-      const thresholdCrossed = prev < 120 && tokens >= 120;
-      const alreadyBeyondButUnclaimed = prev >= 120 && tokens >= 120 && !tokenDualPopupReady && !dualChoiceAlreadyConsumed;
-      if(thresholdCrossed || alreadyBeyondButUnclaimed){
-        if(!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed)){
-          tokenDualPopupReady = true;
-          // Attempt immediate opening if no modal and day conditions otherwise not blocking
-          if(!document.querySelector('.modal-backdrop')){
-            // Deduct now and open directly instead of waiting for end-of-day
-            if(tokens >= 120){ tokens -= 120; saveTokens(); updateTokenCounter(); }
-            tokenDualPopupConsumed = true; tokenDualPopupReady = false;
-            if(isTutorialComplete() && !dualChoiceAlreadyConsumed){ dualChoiceAlreadyConsumed = true; markDualChoiceConsumed(); }
-            openDualThresholdOverlay();
-          }
-        }
+      const thresholdReachedNow = prev < 120 && tokens >= 120;
+      const alreadyAbove = prev >= 120 && tokens >= 120 && !dualChoiceAlreadyConsumed && !isTutorialComplete();
+      if(thresholdReachedNow || alreadyAbove){
+        // Begin watcher to ensure popup eventually opens when UI is free
+        startDualChoiceWatcher();
       }
     }
   }
@@ -480,6 +493,10 @@ async function initApp() {
   enableFreeScroll(rootEl);
   renderDice();
   refreshStates();
+  // Retroactive trigger if already eligible
+  if(tokens >= 120 && !tokenDualPopupConsumed && (!isTutorialComplete() || (isTutorialComplete() && !dualChoiceAlreadyConsumed))){
+    startDualChoiceWatcher();
+  }
   // If player already exceeds token milestone and hasn't consumed it post-tutorial, trigger immediately
   try {
     if(tokens >= 120 && !tokenDualPopupConsumed){
@@ -1235,6 +1252,8 @@ function closeModal() {
       evaluateDayCompletion();
       // Also attempt post-tutorial jackpot trigger if player has full stars but day not ending yet
       ensurePrizeStarJackpotAfterTutorials();
+      // Re-attempt dual-choice milestone if eligible but previously blocked by a modal
+      try { attemptDualChoiceTrigger(); } catch(e){ /* ignore */ }
     }, 60);
   }
   if(pendingMetaTrail){

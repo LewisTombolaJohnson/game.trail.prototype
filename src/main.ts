@@ -4,12 +4,13 @@ import jungleBackgroundUrl from '../assets/jungle/jungle_background.png';
 import carnivalBackgroundUrl from '../assets/carnival/carnival_background.png';
 import tokenIconUrl from '../assets/general/token.svg';
 import carnivalCharacterUrl from '../assets/carnival/carnival_character.png';
-// NOTE: These image assets live in the public/general folder (not importable as modules under Vite's public dir rules)
-// We therefore reference them via root-relative paths instead of import statements.
-const bonusMoneyIconUrl = '/general/BM.png';
-const freePlaysIconUrl = '/general/FP.png';
-const streakKeyIconUrl = '/general/key.png';
-const prizeStarIconUrl = '/general/star.png';
+// NOTE: These image assets live in Vite's public ("assets") directory.
+// Use BASE_URL prefix so they work both locally (root '/') and on GitHub Pages ('/game.trail.prototype/').
+const base = (import.meta as any).env?.BASE_URL || '/';
+const bonusMoneyIconUrl = `${base}general/BM.png`;
+const freePlaysIconUrl = `${base}general/FP.png`;
+const streakKeyIconUrl = `${base}general/key.png`;
+const prizeStarIconUrl = `${base}general/star.png`;
 
 /* Vertical Candy-Crush-like Trail
  - Levels start at bottom and ascend upwards

@@ -861,7 +861,17 @@ function triggerCategoryInteraction(level:number, manual:boolean, depth=0){
     case 'instant_tokens': openInstantTokensModal(assign); break;
     case 'instant_prize': openInstantPrizeModal(assign); break;
     case 'reveal': openRevealModal(assign); break;
-    case 'bonus_round': openBonusRoundModal(assign); break;
+    case 'bonus_round': {
+      const plan = isTutorialActive(dayState.day)? getTutorialPlanForDay(dayState.day) as any : null;
+      if(plan && plan.day===3){
+        // Use Mega Box overlay instead of traditional bonus round on Day 3.
+        openMegaBoxGameOverlay();
+        // Mark assignment complete when overlay closes? Mega Box applies reward internally; mark category now.
+        assign.completed = true; saveCategoryAssignments(); refreshStates();
+        break;
+      }
+      openBonusRoundModal(assign); break;
+    }
     case 'extra_move': openMoveChainModal(assign,true); break;
     case 'travel_back': openMoveChainModal(assign,false); break;
     default: if(depth<2) triggerCategoryInteraction(level, manual, depth+1); break;
@@ -1656,6 +1666,21 @@ function initDebugOverlay() {
           megaBoxBtn.addEventListener('mouseleave', ()=>{ megaBoxBtn.style.background = '#222'; });
           megaBoxBtn.addEventListener('click', ()=>{ openMegaBoxGameOverlay(); });
           debugButtonsEl.appendChild(megaBoxBtn);
+          // Token adjust buttons (+10 / -10)
+          const tokenPlusBtn = document.createElement('button');
+          tokenPlusBtn.type='button'; tokenPlusBtn.textContent='+10 Tokens';
+          Object.assign(tokenPlusBtn.style, { cursor:'pointer', background:'#224422', color:'#fff', border:'1px solid #2d6b2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
+          tokenPlusBtn.addEventListener('mouseenter', ()=>{ tokenPlusBtn.style.background='#2d5d2d'; });
+          tokenPlusBtn.addEventListener('mouseleave', ()=>{ tokenPlusBtn.style.background='#224422'; });
+          tokenPlusBtn.addEventListener('click', ()=>{ addTokens(10); updateCurrencyCounters(); });
+          debugButtonsEl.appendChild(tokenPlusBtn);
+          const tokenMinusBtn = document.createElement('button');
+          tokenMinusBtn.type='button'; tokenMinusBtn.textContent='-10 Tokens';
+          Object.assign(tokenMinusBtn.style, { cursor:'pointer', background:'#442222', color:'#fff', border:'1px solid #6b2d2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
+          tokenMinusBtn.addEventListener('mouseenter', ()=>{ tokenMinusBtn.style.background='#5d2d2d'; });
+          tokenMinusBtn.addEventListener('mouseleave', ()=>{ tokenMinusBtn.style.background='#442222'; });
+          tokenMinusBtn.addEventListener('click', ()=>{ tokens = Math.max(0, tokens - 10); saveCurrencies(); updateCurrencyCounters(); });
+          debugButtonsEl.appendChild(tokenMinusBtn);
           // Close button for convenience
           const closeBtn = mkBtn('Close Debug (0)', 'slot');
           closeBtn.removeEventListener('click', ()=>{}); // remove earlier listener
@@ -1673,6 +1698,14 @@ function initDebugOverlay() {
   });
   // Periodic refresh when visible
   setInterval(() => { if (debugShown) updateDebugOverlay(); }, 400);
+  // Periodic 120 token threshold re-check (every 5s) to auto-trigger dual choice selector if not yet consumed
+  setInterval(()=>{
+    try {
+      if(!dualOverlayConsumedOnce && tokens >= 120){
+        openDualThresholdOverlay();
+      }
+    } catch(e){ /* non-fatal */ }
+  }, 5000);
 }
 
 function updateDebugOverlay() {
@@ -1719,7 +1752,7 @@ function minigameTitle(id:MinigameId){
   switch(id){
     case 'slot': return '3x1 Slot';
     case 'spin_wheel': return 'Spin Wheel';
-    case 'lootbox': return 'Loot Box';
+  case 'lootbox': return 'Loot Box';
     default: return 'Minigame';
   }
 }
@@ -1733,7 +1766,7 @@ function initMinigameUI(assign:MinigameAssignment, root:HTMLDivElement, resultEl
   switch(assign.game){
     case 'slot': return initSlot(root, assign, resultEl);
     case 'spin_wheel': return initSpinWheel(root, assign, resultEl);
-    case 'lootbox': return initLootBox(root, assign, resultEl);
+  case 'lootbox': return initLootBox(root, assign, resultEl);
     default:
       root.innerHTML = `<p style='text-align:center;'>Minigame unavailable.</p>`;
   }
@@ -2151,6 +2184,8 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
   });
 }
 
+// ---- Select Box (3-choice pick) ----
+
 // ---------------- Dice Roll UI ----------------
 let isRolling = false;
 function renderDice() {
@@ -2346,7 +2381,24 @@ function openInstantPrizeModal(assign:CategoryAssignment){
 }
 
 function openBonusRoundModal(assign:CategoryAssignment){
-  const prize = randomBonusRoundPrize(); // already applied
+  const plan = getTutorialPlanForDay(dayState.day);
+  let prize = randomBonusRoundPrize(); // already applied
+  if(plan && plan.day===3 && (plan as any).forceBonusNoTokens){
+    // If the randomly selected prize contains 'Token' text, re-roll until non-token (safety cap to avoid infinite loop)
+    let guard = 0;
+    while(/Token/i.test(prize.label) && guard < 10){
+      prize = randomBonusRoundPrize();
+      guard++;
+    }
+    if(/Token/i.test(prize.label)){
+      // Fallback: forcibly grant a Free Plays or Bonus reward
+      addFreePlays(1);
+      prize = { label: '1 Free Play', apply:()=>{} } as any;
+      console.debug('[Tutorial][Day3][BonusRound] Forced fallback Free Play to avoid token prize.');
+    } else {
+      console.debug('[Tutorial][Day3][BonusRound] Ensured non-token prize:', prize.label);
+    }
+  }
   addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
   assign.completed = true; saveCategoryAssignments(); refreshStates();
   openInfoModal('BONUS ROUND', `<p><strong>${prize.label}</strong></p>${formatMetaBonusLine()}` , ()=>{ 
@@ -2803,10 +2855,17 @@ function finalizeJackpotReward(r:Reward, resultEl:HTMLDivElement, closeBtn:HTMLB
 }
 
 // ================= 120 Token Dual Choice Overlay & Games =================
+let dualOverlayConsumedOnce = false; // guard to prevent multiple token deductions/openings
 function openDualThresholdOverlay(){
   ensureDualStyles();
-  if(document.querySelector('.modal-backdrop')) return;
+  if(dualOverlayConsumedOnce) return; // already consumed/ shown once
+  if(document.querySelector('.modal-backdrop')) return; // another modal open
   closeModal();
+  // Deduct 120 tokens immediately when presenting the choice so periodic checks won't reopen it
+  if(tokens >= 120){
+    tokens -= 120; saveCurrencies(); updateCurrencyCounters();
+  }
+  dualOverlayConsumedOnce = true; tokenDualPopupConsumed = true; tokenDualPopupReady = false;
   const backdrop = document.createElement('div');
   backdrop.className='modal-backdrop dual-choice-backdrop';
   const wrap = document.createElement('div');

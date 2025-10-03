@@ -10,6 +10,8 @@ export const TUTORIAL_DAYS = [
         forcedDice: 4,
         targetLevel: 5,
         reward: { kind: 'minigame', minigame: 'lootbox', forceLootboxAmount: 50, forceLootboxKind: 'bonus', notes: 'Fixed starter 50p bonus to demonstrate bonus currency.' },
+        // Ensure the landed tile behaves as a minigame tile so we actually open the lootbox rather than whatever random category level 5 received.
+        forceLandingCategory: 'minigame',
         autoTriggerCategory: true,
         overrideZone: 'carnival',
         designerNotes: 'Introduce movement + UI.',
@@ -39,6 +41,8 @@ export const TUTORIAL_DAYS = [
         targetLevel: 11,
         // Award 2 free plays explicitly on day 2
         reward: { kind: 'freePlays', amount: 2, notes: 'Two Free Plays to showcase multi-award.' },
+        // Guarantee the tile behaves as an instant prize (not tokens) so we can deterministically award 2 Free Plays.
+        forceLandingCategory: 'instant_prize',
         overrideZone: 'carnival',
         designerNotes: 'Highlight progress & level nodes.',
         popups: {

@@ -2047,9 +2047,10 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
     for(const w of pool){ if(roll < w.weight) return w; roll-=w.weight; }
     return pool[0];
   }
-  // Pre-determine final reward for fairness
+  // Pre-determine final reward for fairness (and deterministic tutorial override)
   let final = pickWeighted();
   const plan = getTutorialPlanForDay(dayState.day);
+  let forcedDay1Reward: Reward | undefined;
   if(plan && plan.reward.kind==='minigame' && plan.reward.minigame==='lootbox'){
     const r:any = plan.reward;
     let forced: Reward | undefined;
@@ -2060,22 +2061,32 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
     if(forced){
       final = { reward: forced, weight: 1, rarity: 'rare' } as typeof final; // rarity nominal
     }
-  }
-  // Absolute fallback: If Day 1 tutorial expected bonus 50p but we somehow didn't map it (e.g., reward list changed), enforce here.
-  if(isTutorialActive(dayState.day) && dayState.day===1){
-    const plan1:any = plan;
-    if(plan1 && plan1.reward && plan1.reward.minigame==='lootbox'){
-      const forced50 = REWARDS.find(r=> r.kind==='bonus' && r.amount===50);
+    // Extra explicit Day 1 mapping irrespective of above success
+    if(isTutorialActive(dayState.day) && dayState.day===1){
+      const forced50 = REWARDS.find(rr=> rr.kind==='bonus' && rr.amount===50);
       if(forced50){
+        forcedDay1Reward = forced50;
         final = { reward: forced50, weight: 1, rarity: 'rare' } as typeof final;
+        console.debug('[Tutorial][Day1][Lootbox] Forcing final reward to 50p Bonus Money during reel construction.');
+      } else {
+        console.warn('[Tutorial][Day1][Lootbox] 50p Bonus Money reward not found in REWARDS list; falling back to earlier forced reward or random.');
       }
     }
   }
-  // Build reel items (populate with random rewards, ensure final appears near end so decel lands there)
-  const ITEM_COUNT = 48;
-  const FINAL_INDEX = 40; // stop with item centered
+  // Build reel items.
+  // Tutorial Day 1 special deterministic reel: 10 filler + 11th forced 50p bonus (or fallback to forced final) for clear UX.
+  let ITEM_COUNT = 48;
+  let FINAL_INDEX = 40; // default behavior
   const reelRewards: WeightedReward[] = [];
-  for(let i=0;i<ITEM_COUNT;i++){ if(i===FINAL_INDEX) reelRewards.push(final); else reelRewards.push(pickWeighted()); }
+  if(isTutorialActive(dayState.day) && dayState.day===1 && forcedDay1Reward){
+    // Fill full-length reel with the same forced reward for absolute visual consistency.
+    for(let i=0;i<ITEM_COUNT;i++){
+      reelRewards.push({ reward: forcedDay1Reward, weight:1, rarity:'rare' });
+    }
+    console.debug('[Tutorial][Day1][Lootbox] Constructed uniform reel (all 50p Bonus Money).');
+  } else {
+    for(let i=0;i<ITEM_COUNT;i++){ if(i===FINAL_INDEX) reelRewards.push(final); else reelRewards.push(pickWeighted()); }
+  }
   root.innerHTML = `<div style='display:flex;flex-direction:column;align-items:center;gap:14px;width:100%;'>
     <div class='lootbox-reel-wrapper' style='position:relative;width:320px;height:86px;overflow:hidden;border:3px solid #555;border-radius:14px;background:#111;'>
       <div class='indicator' style='position:absolute;left:50%;top:0;bottom:0;width:2px;background:#ff9f43;box-shadow:0 0 6px #ff9f43;transform:translateX(-50%);pointer-events:none;'></div>
@@ -2096,9 +2107,10 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
   let started=false;
   btn.addEventListener('click',()=>{
     if(started||assign.completed) return; started=true; btn.disabled=true; btn.textContent='Opening...';
-    const itemWidth = 96+8; // width + gap
-    const targetOffset = (FINAL_INDEX * itemWidth) - (320/2 - itemWidth/2);
-    const duration = 4500;
+  const itemWidth = 96+8; // width + gap
+  const targetOffset = (FINAL_INDEX * itemWidth) - (320/2 - itemWidth/2);
+  // Shorter duration for small deterministic reel to feel snappy; keep original otherwise.
+  const duration = 4500; // revert to default duration
     const start = performance.now();
     function easeOutCubic(t:number){ return 1 - Math.pow(1-t,3); }
     function frame(now:number){
@@ -2124,7 +2136,16 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
       finalEl.animate([
         { transform:'scale(1)' },{ transform:'scale(1.15)' },{ transform:'scale(1)' }
       ],{ duration:600, easing:'ease' });
-      const rewardObj = reelRewards[bestIndex].reward;
+      let rewardObj = reelRewards[bestIndex].reward;
+      // Final enforcement for Day 1: regardless of visual selection, override to forcedDay1Reward if defined
+      if(isTutorialActive(dayState.day) && dayState.day===1 && forcedDay1Reward){
+        console.debug('[Tutorial][Day1][Lootbox] Overriding visually selected reward', rewardObj?.label, '->', forcedDay1Reward.label);
+        rewardObj = forcedDay1Reward;
+        // Also update the visual element so user sees the correct prize
+        if(finalEl){
+          finalEl.innerHTML = `<span style='font-size:12px;'>${rewardObj.label.replace(/\s+/g,'<br>')}</span>`;
+        }
+      }
       finalizeMinigameManual(assign, rewardObj, resultEl);
     }
   });
@@ -2302,7 +2323,13 @@ function randomBonusRoundPrize(){
 
 function openInstantPrizeModal(assign:CategoryAssignment){
   let label:string;
-  if(assign.forcedReward){
+  const plan = getTutorialPlanForDay(dayState.day);
+  if(plan && plan.day===2 && plan.reward.kind==='freePlays' && plan.reward.amount===2){
+    // Deterministic Day 2 instant prize: always 2 Free Plays (no tokens).
+    addFreePlays(2);
+    label = '2 Free Plays';
+    console.debug('[Tutorial][Day2][InstantPrize] Forced 2 Free Plays.');
+  } else if(assign.forcedReward){
     applyReward(assign.forcedReward);
     label = assign.forcedReward.label;
   } else {

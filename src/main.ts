@@ -2061,6 +2061,16 @@ function initLootBox(root:HTMLDivElement, assign:MinigameAssignment, resultEl:HT
       final = { reward: forced, weight: 1, rarity: 'rare' } as typeof final; // rarity nominal
     }
   }
+  // Absolute fallback: If Day 1 tutorial expected bonus 50p but we somehow didn't map it (e.g., reward list changed), enforce here.
+  if(isTutorialActive(dayState.day) && dayState.day===1){
+    const plan1:any = plan;
+    if(plan1 && plan1.reward && plan1.reward.minigame==='lootbox'){
+      const forced50 = REWARDS.find(r=> r.kind==='bonus' && r.amount===50);
+      if(forced50){
+        final = { reward: forced50, weight: 1, rarity: 'rare' } as typeof final;
+      }
+    }
+  }
   // Build reel items (populate with random rewards, ensure final appears near end so decel lands there)
   const ITEM_COUNT = 48;
   const FINAL_INDEX = 40; // stop with item centered

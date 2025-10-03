@@ -15,7 +15,7 @@ export const TUTORIAL_DAYS = [
         designerNotes: 'Introduce movement + UI.',
         popups: {
             start_day: [
-                "<p>Welcome to tombola trails! I’m BIG STEVE, your guide to this world!</p>",
+                "<p>Welcome to tombola trails! I’m Tom, your guide to this world!</p>",
                 "<p>Before I forget, here is your daily dice, you can roll this every day to move through the world and earn rewards, why not give it a try?</p>"
             ],
             post_move: [

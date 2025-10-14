@@ -70,6 +70,204 @@ const STREAK_STATE_KEY = 'streakStateV1'; // legacy key retained for migration
 const LEVEL_STATE_KEY = 'levelStateV1';
 const DUAL_CHOICE_MILESTONE_KEY = 'dualChoiceMilestoneConsumedV1';
 const PRIZE_STAR_MILESTONE_KEY = 'prizeStarMilestoneCycleV1';
+const ENGAGEMENT_STATE_KEY = 'engagementStateV1'; // streak & milestone state
+
+// Engagement (7-day streak + 30-day milestone)
+interface EngagementState { consecutiveDays: number; cumulativeDays: number; milestoneCycles: number; milestoneProgress: number; }
+let engagement: EngagementState = { consecutiveDays:0, cumulativeDays:0, milestoneCycles:0, milestoneProgress:0 };
+function loadEngagement(){ try { const raw = localStorage.getItem(ENGAGEMENT_STATE_KEY); if(!raw) return; const d=JSON.parse(raw); if(typeof d.consecutiveDays==='number') engagement.consecutiveDays=Math.max(0,Math.min(7,Math.floor(d.consecutiveDays))); if(typeof d.cumulativeDays==='number') engagement.cumulativeDays=Math.max(0,Math.floor(d.cumulativeDays)); if(typeof d.milestoneCycles==='number') engagement.milestoneCycles=Math.max(0,Math.floor(d.milestoneCycles)); if(typeof d.milestoneProgress==='number') engagement.milestoneProgress=Math.max(0,Math.min(29,Math.floor(d.milestoneProgress))); } catch{} }
+function saveEngagement(){ localStorage.setItem(ENGAGEMENT_STATE_KEY, JSON.stringify(engagement)); }
+function updateEngagementUI(){ /* debug engagement UI removed */ }
+function transientToast(msg:string){ let h=document.getElementById('toast-host'); if(!h){ h=document.createElement('div'); h.id='toast-host'; Object.assign(h.style,{position:'fixed',bottom:'16px',left:'50%',transform:'translateX(-50%)',zIndex:'4000',display:'flex',flexDirection:'column',gap:'8px',pointerEvents:'none'}); document.body.appendChild(h);} const el=document.createElement('div'); el.textContent=msg; Object.assign(el.style,{background:'#111c',color:'#fff',padding:'8px 12px',borderRadius:'8px',fontSize:'12px',letterSpacing:'.5px',boxShadow:'0 4px 10px rgba(0,0,0,0.5)',backdropFilter:'blur(6px)'}); h.appendChild(el); setTimeout(()=>{ el.style.transition='opacity 500ms'; el.style.opacity='0'; setTimeout(()=> el.remove(),540); },2200); }
+// Sync only prizeStars to milestoneProgress; streakKeys are now an accumulating currency.
+function syncMirroredCurrencies(){
+  if(prizeStars !== engagement.milestoneProgress){ prizeStars = engagement.milestoneProgress; }
+  saveCurrencies(); updateCurrencyCounters();
+}
+function awardSevenDay(){
+  transientToast('7-Day Streak Complete!');
+  engagement.consecutiveDays = 0; // reset streak progress (retain keys until jackpot completion)
+  saveEngagement(); updateEngagementUI();
+  if(!prizeStarJackpotPlayedToday){
+    const blocked = isAnyModalActive() || forceReplayPhases.size>0; // tutorial or other modal active
+    if(blocked){
+      // Defer until modal stack clears. We'll also schedule a safety re-check.
+      pendingStreakJackpot = true;
+      setTimeout(()=>{ if(pendingStreakJackpot && !isAnyModalActive()){ pendingStreakJackpot=false; if(!prizeStarJackpotPlayedToday){ try { openPrizeStarJackpot(); } catch{} } } }, 1200);
+    } else {
+      try { openPrizeStarJackpot(); } catch {/* ignore */}
+    }
+  }
+}
+function awardThirtyDay(){
+  transientToast('30-Day Milestone: Safe Game!');
+  engagement.milestoneCycles += 1;
+  engagement.milestoneProgress = 0;
+  prizeStars = 0; // reset mirrored visual
+  saveEngagement(); saveCurrencies(); updateCurrencyCounters(); updateEngagementUI();
+  // Launch a dedicated safe minigame overlay (placeholder implementation)
+  try { openSafeGameOverlay(); } catch { /* If not implemented yet, no-op */ }
+}
+
+// Placeholder Safe Game overlay (to be replaced with real implementation)
+// Safe cracking minigame (mastermind-style) ---------------------------------------------------
+interface SafeGameState { code:string; attempts: string[]; solved:boolean; }
+let safeGameState: SafeGameState | null = null;
+function generateSafeCode(): string {
+  // 3-digit non-repeating from 1..9 (exclude 0 per request)
+  const digits = ['1','2','3','4','5','6','7','8','9'];
+  for(let i=digits.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [digits[i],digits[j]]=[digits[j],digits[i]]; }
+  return digits.slice(0,3).join('');
+}
+function startSafeGame(){
+  safeGameState = { code: generateSafeCode(), attempts: [], solved:false };
+}
+function evaluateGuess(guess:string){
+  if(!safeGameState) return {exact:0, partial:0};
+  const code = safeGameState.code;
+  let exact=0, partial=0;
+  for(let i=0;i<guess.length;i++) if(guess[i]===code[i]) exact++;
+  for(let i=0;i<guess.length;i++) if(guess[i]!==code[i] && code.includes(guess[i])) partial++;
+  return {exact, partial};
+}
+function safeRewardSuccess(){
+  // High-tier guaranteed reward: choose best available non-nothing with weighting
+  const high = REWARDS.filter(r=> r.kind!=='nothing' && r.kind!=='prizeStars' && r.kind!=='streakKeys');
+  let pick = high[Math.floor(Math.random()*high.length)] || {kind:'tokens', amount:200, label:'200 Tokens'} as Reward;
+  // Triple reward value for amount-based kinds
+  if(pick.amount && typeof pick.amount==='number'){
+    const newAmount = pick.amount * 3;
+    pick = { ...pick, amount: newAmount, label: pick.kind==='tokens'? `${newAmount} Tokens` : pick.kind==='cash'? formatCash(newAmount): pick.kind==='freePlays'? `${newAmount} Free Plays` : pick.kind==='bonus'? `${formatCash(newAmount)} Bonus` : pick.label+` x3` } as Reward;
+  } else {
+    pick = { ...pick, label: pick.label + ' x3'};
+  }
+  applyReward(pick);
+  transientToast('Safe Cracked! Reward: '+pick.label);
+  return pick;
+}
+// Failure path removed for infinite attempts mode
+function openSafeGameOverlay(){
+  closeModal();
+  startSafeGame(); // always start fresh (new code & empty attempts)
+  const { attempts } = safeGameState!;
+  const backdrop = document.createElement('div'); backdrop.className='modal-backdrop safe-game-backdrop';
+  const modal = document.createElement('div'); modal.className='modal safe-game-modal'; modal.setAttribute('role','dialog');
+  modal.style.maxWidth='520px'; // tighter max width to avoid spilling outside game area
+  modal.style.width='100%';
+  modal.style.boxSizing='border-box';
+  modal.style.margin='0 auto';
+  modal.innerHTML = `
+    <h2 style='margin-top:0;text-align:center;'>Safe Crack (Code Wordle)</h2>
+    <p style='text-align:center;margin:0 0 14px;font-size:14px;'>Guess the 3 unique digits (1-9). Infinite attempts. Safe reward pays <strong>3×</strong> normal!</p>
+    <form class='safe-wordle-form' style='display:flex;justify-content:center;gap:10px;margin-bottom:14px;'>
+      <input type='text' inputmode='numeric' maxlength='1' class='safe-cell-input' data-idx='0' style='width:64px;height:64px;text-align:center;font-size:30px;font-weight:700;border:2px solid #555;border-radius:12px;background:#222;color:#fff;' />
+      <input type='text' inputmode='numeric' maxlength='1' class='safe-cell-input' data-idx='1' style='width:64px;height:64px;text-align:center;font-size:30px;font-weight:700;border:2px solid #555;border-radius:12px;background:#222;color:#fff;' />
+      <input type='text' inputmode='numeric' maxlength='1' class='safe-cell-input' data-idx='2' style='width:64px;height:64px;text-align:center;font-size:30px;font-weight:700;border:2px solid #555;border-radius:12px;background:#222;color:#fff;' />
+      <button type='submit' class='primary' style='height:64px;padding:0 22px;font-size:16px;border-radius:14px;'>Enter</button>
+    </form>
+    <div class='attempts-grid' style='display:flex;flex-direction:column;gap:6px;max-height:260px;overflow:auto;padding-right:4px;'></div>
+    <div class='safe-footer' style='display:flex;justify-content:center;margin-top:18px;'>
+      <button type='button' class='close-safe tertiary' style='padding:8px 18px;'>Close</button>
+    </div>`;
+  const form = modal.querySelector('.safe-wordle-form') as HTMLFormElement;
+  const inputs = Array.from(form.querySelectorAll('.safe-cell-input')) as HTMLInputElement[];
+  const attemptsGrid = modal.querySelector('.attempts-grid') as HTMLDivElement;
+  function focusNext(idx:number){ const next=inputs[idx+1]; if(next) next.focus(); }
+  inputs.forEach(inp=>{
+  inp.addEventListener('input',()=>{ inp.value=inp.value.replace(/[^1-9]/g,''); if(inp.value.length===1) focusNext(parseInt(inp.dataset.idx!)); });
+    inp.addEventListener('keydown',e=>{ if(e.key==='Backspace' && !inp.value){ const prev=inputs[parseInt(inp.dataset.idx!)-1]; prev?.focus(); }});
+  });
+  function renderAttempts(){
+    attemptsGrid.innerHTML = attempts.map(g=> attemptRowHTML(g)).join('');
+  }
+  function attemptRowHTML(guess:string){
+    const code = safeGameState!.code;
+    let html='';
+    for(let i=0;i<3;i++){
+      const d=guess[i];
+      let cls='neutral';
+      if(code[i]===d) cls='exact'; else if(code.includes(d)) cls='partial';
+      html+=`<div class='safe-cell ${cls}' data-g='${d}'>${d}</div>`;
+    }
+    return `<div class='safe-attempt-row' style='display:flex;gap:6px;'>${html}</div>`;
+  }
+  form.addEventListener('submit',e=>{
+    e.preventDefault(); if(!safeGameState || safeGameState.solved) return;
+    const guess = inputs.map(i=> i.value||'').join('');
+    if(guess.length!==3){ transientToast('Enter 3 digits'); return; }
+    if(new Set(guess.split('')).size!==3){ transientToast('Digits must be unique'); return; }
+    safeGameState.attempts.push(guess);
+    renderAttempts();
+    if(guess===safeGameState.code){
+      safeGameState.solved=true; const reward = safeRewardSuccess(); showSafeSolved(modal, guess, reward); form.querySelector('button[type="submit"]')!.setAttribute('disabled','true');
+    }
+    inputs.forEach(i=> i.value=''); inputs[0].focus();
+  });
+  renderAttempts();
+  function refreshAttempts(){
+    // obsolete in wordle mode
+  }
+  const closeBtn = modal.querySelector('.close-safe') as HTMLButtonElement;
+  closeBtn.addEventListener('click',()=> closeModal());
+  backdrop.addEventListener('click',e=>{ if(e.target===backdrop) closeModal(); });
+  backdrop.appendChild(modal); document.body.appendChild(backdrop); document.body.classList.add('modal-open');
+  injectSafeStyles();
+}
+function showSafeSolved(modal:HTMLElement, guess:string, reward?:Reward){
+  const overlay = document.createElement('div');
+  overlay.style.position='absolute'; overlay.style.inset='0'; overlay.style.display='flex'; overlay.style.flexDirection='column'; overlay.style.alignItems='center'; overlay.style.justifyContent='center'; overlay.style.background='rgba(0,0,0,0.75)';
+  overlay.innerHTML = `<div style='animation:pop .5s;max-width:380px;text-align:center;'>
+    <h3 style='margin:0 0 6px;font-size:30px;color:#6ffd7f;'>Safe Cracked!</h3>
+    <p style='margin:0 0 8px;font-size:15px;'>Code: <strong>${guess}</strong></p>
+    ${reward?`<div style='margin:0 auto 14px;padding:10px 16px;background:#132d13;border:2px solid #37b544;border-radius:12px;color:#c8ffd1;font-weight:600;font-size:16px;'>Reward: ${reward.label}</div>`:''}
+    <button class='primary close-safe-finish' style='padding:10px 24px;font-size:16px;border-radius:28px;'>Great!</button>
+  </div>`;
+  modal.appendChild(overlay);
+  overlay.querySelector('.close-safe-finish')?.addEventListener('click',()=> closeModal());
+  spawnSafeConfetti(modal.parentElement!);
+}
+// Failure overlay removed in infinite attempts mode
+function spawnSafeConfetti(host:HTMLElement){
+  for(let i=0;i<60;i++){
+    const el=document.createElement('div');
+    el.className='safe-confetti';
+    const hue = 40 + Math.random()*60;
+    const size = 5+Math.random()*7;
+    Object.assign(el.style,{
+      position:'absolute',top:'50%',left:'50%',width:size+'px',height:size+'px',
+      background:`hsl(${hue} 90% 60%)`,
+      transform:'translate(-50%,-50%)',
+      animation:'safeConfetti 2.2s linear forwards',
+      borderRadius: Math.random()>0.5?'50%':'2px',
+      pointerEvents:'none'
+    });
+    host.appendChild(el);
+    setTimeout(()=> el.remove(),2300);
+  }
+}
+let safeStylesInjected=false;
+function injectSafeStyles(){ if(safeStylesInjected) return; safeStylesInjected=true; const st=document.createElement('style'); st.textContent=`
+@keyframes safeConfetti { 0% { transform:translate(-50%,-50%) scale(1) rotate(0deg); opacity:1;} 80%{opacity:1;} 100% { transform:translate(calc(-50% + (var(--dx, 0px))), calc(-50% + 260px)) scale(.5) rotate(720deg); opacity:0; } }
+@keyframes pop { 0% { transform:scale(.6); opacity:0;} 60% { transform:scale(1.05); opacity:1;} 100% { transform:scale(1); } }
+.safe-game-modal { position:relative; max-width:520px; width:100%; box-sizing:border-box; }
+@media (max-width:560px){
+  .safe-game-modal { max-width:95vw; }
+  .safe-game-modal form.safe-wordle-form { gap:6px !important; }
+  .safe-game-modal .safe-cell-input { width:56px !important; height:56px !important; font-size:26px !important; }
+  .safe-attempt-row .safe-cell { width:46px; height:46px; font-size:20px; }
+}
+.safe-attempt-row .safe-cell { width:52px; height:52px; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:600; border-radius:10px; background:#222; border:2px solid #444; color:#fff; }
+.safe-attempt-row .safe-cell.exact { background:#2f7d36; border-color:#37b544; box-shadow:0 0 0 2px #37b54455 inset; }
+.safe-attempt-row .safe-cell.partial { background:#8a6a15; border-color:#d1a526; box-shadow:0 0 0 2px #d1a52655 inset; }
+.safe-attempt-row .safe-cell.neutral { background:#333; }
+`; document.head.appendChild(st);} 
+// Day completion no longer auto-increments engagement; increments happen when rewards grant keys/stars.
+function updateEngagementOnCompletedDay(){
+  // Maintain cumulative count for analytics if a roll occurred
+  engagement.cumulativeDays += 1;
+  saveEngagement(); updateEngagementUI();
+}
+function resetConsecutive(){ engagement.consecutiveDays=0; saveEngagement(); updateEngagementUI(); }
 
 interface DayState { day: number; rollUsed: boolean }
 let dayState: DayState = { day: 1, rollUsed: false };
@@ -223,25 +421,123 @@ function saveCurrencies() {
 function addFreePlays(n:number){ if(n>0){ freePlays+=n; saveCurrencies(); updateCurrencyCounters(); } }
 function addCashPence(n:number){ if(n>0){ cashPence+=n; saveCurrencies(); updateCurrencyCounters(); } }
 function addBonusPence(n:number){ if(n>0){ bonusPence+=n; saveCurrencies(); updateCurrencyCounters(); } }
-function addStreakKeys(n:number){ if(n>0){ streakKeys+=n; saveCurrencies(); updateCurrencyCounters(); } }
+// Reinterpret external addition calls as progression increments, maintaining mirroring.
+function addStreakKeys(n:number){
+  if(n>0){
+    // If we somehow receive keys before a roll, treat it as a played action so day-end logic can count the day.
+    if(!dayState.rollUsed){ dayState.rollUsed = true; saveDayState(); }
+    streakKeys += n; // accumulate
+    // Increment streak progression once per key earned (cap at 7 before award)
+    engagement.consecutiveDays = Math.min(7, engagement.consecutiveDays + n);
+    if(engagement.consecutiveDays === 7) awardSevenDay();
+    saveCurrencies();
+    saveEngagement();
+    updateCurrencyCounters();
+    updateEngagementUI();
+  }
+}
 function addPrizeStars(n:number){
   if(n>0){
-    prizeStars+=n; saveCurrencies(); updateCurrencyCounters();
-    // After tutorial, allow jackpot to trigger immediately when reaching 5/5 mid-day
-    try {
-      if(isTutorialComplete && typeof isTutorialComplete==='function' && isTutorialComplete()){
-        if(prizeStars >=5){
-          // If a modal is open we'll rely on closeModal -> ensurePrizeStarJackpotAfterTutorials;
-          // otherwise attempt immediate trigger.
-          if(!document.querySelector('.modal-backdrop')){
-            if(typeof prizeStarJackpotPlayedToday !== 'undefined' && !prizeStarJackpotPlayedToday){
-              openPrizeStarJackpot();
-            }
-          }
-        }
+    const before = engagement.milestoneProgress;
+    engagement.milestoneProgress = (engagement.milestoneProgress + n) % 30;
+    syncMirroredCurrencies();
+    // Midpoint instant rewards at 10 and 20 (do not reset progress)
+    const after = engagement.milestoneProgress;
+    // We need to detect crossing these thresholds considering wrapping. We'll evaluate each increment step.
+    // Simple approach: iterate each awarded star individually to see if a threshold was reached.
+    for(let i=1;i<=n;i++){
+      const stepValue = (before + i) % 30;
+      if(stepValue === 10 || stepValue === 20){
+        try { awardMilestoneMidpoint(stepValue); } catch{}
       }
-    } catch(e){ /* non-fatal */ }
+    }
+    if(engagement.milestoneProgress === 0 && (before + n) >= 30) awardThirtyDay();
+    saveEngagement(); updateEngagementUI();
   }
+}
+
+function awardMilestoneMidpoint(point:number){
+  // Define an "instant win" – reuse existing reward selection but bias to non-nothing.
+  // Could alternatively grant a fixed pack; for now select reward excluding 'nothing'.
+  const pool = REWARDS.filter(r=> r.kind !== 'nothing');
+  const reward = pool[Math.floor(Math.random()*pool.length)];
+  applyReward(reward);
+  // Animated popup modal celebrating 10/20 day milestone
+  try {
+    const existing = document.querySelector('.milestone-midpoint-modal');
+    if(existing) existing.remove();
+    const backdrop = document.createElement('div');
+    backdrop.className='modal-backdrop milestone-midpoint-backdrop';
+    Object.assign(backdrop.style,{backdropFilter:'blur(5px)',animation:'fadeIn .35s'});
+    const modal = document.createElement('div');
+    modal.className='modal milestone-midpoint-modal';
+    modal.style.maxWidth='520px'; modal.style.width='100%'; modal.style.overflow='hidden';
+    const title = point===10? '10 Day Milestone Achieved!' : '20 Day Milestone Achieved!';
+    modal.innerHTML = `
+      <div style="position:relative;padding:28px 28px 32px;text-align:center;background:radial-gradient(circle at 50% 0%, #ffe8a8, #ffbb55 60%, #d97100);color:#2b1a00;">
+        <div class='milestone-burst' style="position:absolute;inset:0;pointer-events:none;">
+          ${Array.from({length:18}).map((_ ,i)=>`<span style='--i:${i};position:absolute;top:50%;left:50%;width:6px;height:14px;background:#fff;border-radius:3px;transform-origin:center 38px;animation:burstSpin 1.6s ease-out forwards;'></span>`).join('')}
+        </div>
+        <h2 style='margin:0 0 10px;font-size:30px;letter-spacing:1px;'>${title}</h2>
+        <p style='margin:0 0 18px;font-size:15px;line-height:1.4;'>Bonus Reward Unlocked:</p>
+        <div style='display:inline-block;padding:14px 22px;background:#fffbe8;border:2px solid #ffcf66;border-radius:14px;box-shadow:0 4px 18px -4px rgba(0,0,0,.4),0 0 0 4px rgba(255,255,255,.4) inset;font-weight:600;font-size:18px;'>${reward.label}</div>
+        <div style='margin-top:26px;'>
+          <button type='button' class='primary midpoint-close' style='font-size:16px;padding:10px 26px;border-radius:28px;'>Awesome!</button>
+        </div>
+      </div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    document.body.classList.add('modal-open');
+    const close = modal.querySelector('.midpoint-close') as HTMLButtonElement;
+    close.addEventListener('click',()=>{ closeModal(); });
+    // Auto sparkle confetti
+    spawnMilestoneParticles(point, backdrop);
+    injectMilestoneStyles();
+  } catch{}
+}
+
+function spawnMilestoneParticles(point:number, host:HTMLElement){
+  for(let i=0;i<40;i++){
+    const el = document.createElement('div');
+    el.className='milestone-confetti';
+    const hueBase = point===10? 40:280;
+    const hue = hueBase + Math.random()*40 - 20;
+    const size = 6+Math.random()*8;
+    Object.assign(el.style,{
+      position:'absolute',
+      top:'50%',left:'50%',
+      width:size+'px',height:size+'px',
+      background:`hsl(${hue} 90% 60%)`,
+      transform:`translate(-50%,-50%) rotate(${Math.random()*360}deg)`,
+      borderRadius: Math.random()>0.5? '50%':'2px',
+      pointerEvents:'none',
+      animation:'confettiFloat 1.8s linear forwards',
+      animationDelay:(Math.random()*0.4)+'s'
+    });
+    host.appendChild(el);
+    setTimeout(()=> el.remove(), 2200);
+  }
+}
+
+let milestoneStylesInjected=false;
+function injectMilestoneStyles(){
+  if(milestoneStylesInjected) return; milestoneStylesInjected=true;
+  const style = document.createElement('style');
+  style.textContent = `
+  @keyframes confettiFloat { 0% { transform:translate(-50%,-50%) scale(1) rotate(0deg); opacity:1;} 70% {opacity:1;} 100% { transform:translate(calc(-50% + (var(--dx, 0px))), calc(-50% + 220px)) scale(.5) rotate(720deg); opacity:0;} }
+  @keyframes burstSpin { from { opacity:0; transform: translate(-50%,-50%) rotate(calc(var(--i)*20deg)) scale(0);} 30% {opacity:1;} to { opacity:0; transform: translate(-50%,-50%) rotate(calc(var(--i)*20deg)) scale(1.6);} }
+  .milestone-midpoint-backdrop { animation: fadeIn .3s ease; }
+  `;
+  document.head.appendChild(style);
+}
+
+// Unified +1 streak key +1 prize star award (engagement progression) + animation flag
+function awardEngagementProgress(){
+  addStreakKeys(1); // handles cap + 7-day award
+  addPrizeStars(1); // handles 30-day rollover
+  pendingMetaTrail = true;
+  // Re-evaluate next-day availability in case this was the last required action
+  try { evaluateDayCompletion(); } catch {}
 }
 
 // Minigame assignments
@@ -486,6 +782,7 @@ async function initApp() {
   loadCurrencies();
   loadDayState();
   loadLevelState();
+  loadEngagement();
   ensureCategoryAssignments(); // new category system (includes embedded minigames)
   await app.init({ backgroundAlpha: 0, antialias: true, width: viewWidth, height: viewHeight, autoDensity: true });
   const rootEl = document.getElementById('pixi-root');
@@ -1148,9 +1445,13 @@ function renderControls() {
         <div class="currency-meta" aria-label="Meta Progress">
           <div class="currency day-counter pill" title="Current Day"><span class="label">Day</span><span class="day-count">1</span></div>
           <div class="currency level-counter pill" title="Player Level"><span class="label">Lvl</span><span class="level-count">1</span></div>
-          <div class="prize-star-progress" title="Prize Star Progress" aria-label="Prize Star Progress">
-            <div class="ps-progress-bar"><div class="ps-progress-fill"></div></div>
-            <div class="ps-progress-label"><span class="ps-progress-count">0</span>/5 <img src="${prizeStarIconUrl}" alt="Prize Star" class="currency-icon star-icon" /></div>
+          <div class="progress-block prize-star-progress" title="Milestone Progress" aria-label="Milestone Progress" data-kind="milestone">
+            <div class="progress-bar"><div class="progress-fill ps-progress-fill"></div></div>
+            <div class="progress-label"><img src="${prizeStarIconUrl}" alt="Star" class="progress-icon" /><span class="progress-count ps-progress-count">0/10</span></div>
+          </div>
+          <div class="progress-block streak-progress" title="7-Day Streak" aria-label="7-Day Streak">
+            <div class="progress-bar"><div class="progress-fill sp-fill"></div></div>
+            <div class="progress-label"><img src="${streakKeyIconUrl}" alt="Key" class="progress-icon" /><span class="progress-count sp-count">0/7</span></div>
           </div>
         </div>
         <div class="currency-group-card" aria-label="Reward Currencies">
@@ -1160,6 +1461,7 @@ function renderControls() {
           <div class="currency ps-counter pill" title="Prize Stars"><img src="${prizeStarIconUrl}" alt="Prize Star" class="currency-icon star-icon" /><span class="ps-count">0</span></div>
           <div class="currency token-counter pill"><img src="${tokenIconUrl}" alt="Token" class="token-icon" /><span class="token-count">0</span></div>
           <div class="currency cash-counter pill" title="Cash Balance"><span class="label">💰</span><span class="cash-count">0</span></div>
+          
         </div>
       </div>
       <div class="control-row" style="display:flex;gap:8px;margin-top:10px;">
@@ -1189,9 +1491,17 @@ function renderControls() {
     .currency-bar img.token-icon{width:18px;height:18px;display:block;}
     .currency-bar img.currency-icon{width:18px;height:18px;display:block;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6));}
     .currency-bar span{display:inline-block;min-width:14px;text-align:right;}
-  .prize-star-progress{position:relative;display:flex;flex-direction:column;padding:6px 8px 8px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:150px;}
-  .ps-progress-bar{position:relative;width:100%;height:24px;background:#1f262d;border:1px solid #36424d;border-radius:10px;overflow:hidden;display:flex;align-items:center;}
-  .ps-progress-fill{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.6) inset,0 0 4px rgba(255,159,67,0.55);transition:width .6s cubic-bezier(.4,.8,.2,1),filter .5s;}
+  .progress-block{position:relative;display:flex;flex-direction:column;padding:6px 8px 10px;background:rgba(15,18,22,0.55);border:1px solid #2a333c;border-radius:14px;min-width:160px;}
+  .progress-block + .progress-block{margin-top:6px;}
+  .progress-bar{position:relative;width:100%;height:12px;background:#1f262d;border:1px solid #36424d;border-radius:8px;overflow:hidden;}
+  .progress-fill{position:absolute;left:0;top:0;bottom:0;width:0;transition:width .55s cubic-bezier(.4,.8,.2,1);}
+  .prize-star-progress .progress-fill{background:linear-gradient(90deg,#ffcf9a,#ff9f43);box-shadow:0 0 6px rgba(255,159,67,0.5) inset,0 0 4px rgba(255,159,67,0.45);} 
+  .streak-progress .progress-fill{background:linear-gradient(90deg,#57c1ff,#0077ff);box-shadow:0 0 6px rgba(87,193,255,0.5) inset,0 0 4px rgba(87,193,255,0.45);} 
+  .progress-label{pointer-events:none;position:absolute;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;gap:6px;font-size:13px;font-weight:800;letter-spacing:.6px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.9),0 0 4px rgba(0,0,0,0.55);} 
+  .progress-block .progress-icon{width:16px;height:16px;object-fit:contain;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6));}
+  .progress-count{display:inline-block;min-width:52px;text-align:center;}
+  .prize-star-progress.ps-progress-complete .progress-label{color:#222;}
+  .prize-star-progress.ps-progress-complete .progress-fill{filter:drop-shadow(0 0 6px #ff9f43) drop-shadow(0 0 12px rgba(255,159,67,.75));animation:psPulse 1.6s ease-in-out infinite alternate;}
   /* Level-up glow flash after jackpot */
   .prize-star-progress.ps-level-up .ps-progress-fill{animation:psLevelUpFlash 1.6s ease forwards;}
   @keyframes psLevelUpFlash{0%{filter:drop-shadow(0 0 0px #ff9f43) brightness(1);}40%{filter:drop-shadow(0 0 10px #ffcd8a) brightness(1.3);}70%{filter:drop-shadow(0 0 5px #ff9f43) brightness(1.1);}100%{filter:drop-shadow(0 0 0px #ff9f43) brightness(1);} }
@@ -1225,6 +1535,7 @@ function renderControls() {
   updateResetButton();
   updateTokenCounter();
   updateDayUI();
+  updateEngagementUI();
 }
 function updateResetButton() { const btn = document.querySelector('[data-action="reset"]') as HTMLButtonElement | null; if (btn) btn.disabled = progress.current === 1; }
 
@@ -1236,6 +1547,15 @@ function performFullReset(){
   minigameAssignments.forEach(m=>{ m.completed = false; }); saveMinigameAssignments();
   tokens = 0; saveTokens();
   freePlays = 0; cashPence = 0; bonusPence = 0; streakKeys = 0; prizeStars = 0; saveCurrencies(); updateCurrencyCounters();
+  // Reset engagement (streak & milestone) and mirrored currencies
+  engagement.consecutiveDays = 0; // streak progress resets
+  engagement.cumulativeDays = 0; // optional: wipe total history on full reset
+  engagement.milestoneCycles = 0;
+  engagement.milestoneProgress = 0;
+  saveEngagement();
+  // Ensure mirrors reflect cleared state
+  if(typeof syncMirroredCurrencies === 'function') syncMirroredCurrencies(); // will sync prizeStars only
+  updateEngagementUI();
   dayState.day = 1; dayState.rollUsed = false; saveDayState(); updateDayUI();
   levelState.level = 1; saveLevelState(); updateLevelUI();
   document.querySelectorAll('.inline-next-day-btn').forEach(el=> el.remove());
@@ -1312,18 +1632,31 @@ function updateCurrencyCounters(){
   const sk = document.querySelector('.sk-count'); if(sk) sk.textContent = String(streakKeys);
   const ps = document.querySelector('.ps-count'); if(ps) ps.textContent = String(prizeStars);
   updatePrizeStarProgress();
+  updateStreakProgress();
   updateLevelUI();
 }
 function updatePrizeStarProgress(){
   const wrap = document.querySelector('.prize-star-progress'); if(!wrap) return;
   const fill = wrap.querySelector('.ps-progress-fill') as HTMLDivElement | null;
   const count = wrap.querySelector('.ps-progress-count') as HTMLSpanElement | null;
-  if(count) count.textContent = String(Math.min(5, prizeStars));
+  const total = engagement.milestoneProgress; // 0..29 cumulative within cycle
+  const segment = Math.floor(total/10); // 0,1,2
+  const inSeg = total - segment*10; // 0..9 progress inside current 10-block
+  const denom = segment===0?10:segment===1?20:30; // dynamic denominator grows
+  if(count) count.textContent = `${total}/${denom}`; // e.g. 7/10, 12/20, 25/30
   if(fill){
-    const pct = Math.min(1, prizeStars/5);
-    fill.style.width = (pct*100)+'%';
-    if(pct>=1) wrap.classList.add('ps-progress-complete'); else wrap.classList.remove('ps-progress-complete');
+    const pct = (inSeg/10)*100; // per-segment visual fill
+    fill.style.width = pct+'%';
+    if(inSeg===9) wrap.classList.add('ps-progress-complete'); else wrap.classList.remove('ps-progress-complete');
   }
+}
+function updateStreakProgress(){
+  const wrap = document.querySelector('.streak-progress'); if(!wrap) return;
+  const fill = wrap.querySelector('.sp-fill') as HTMLDivElement | null;
+  const count = wrap.querySelector('.sp-count') as HTMLSpanElement | null;
+  const current = engagement.consecutiveDays; // 0..7
+  if(count) count.textContent = `${current}/7`;
+  if(fill){ fill.style.width = ((current/7)*100)+'%'; }
 }
 function updateDayUI(){
   const daySpan = document.querySelector('.day-count'); if(daySpan) daySpan.textContent = String(dayState.day);
@@ -1394,11 +1727,12 @@ function closeModal() {
   }
   if(!fired){
     setTimeout(()=> {
-      // First try day completion (may queue jackpot via existing evaluate logic if triggered at end of day)
       evaluateDayCompletion();
-      // Also attempt post-tutorial jackpot trigger if player has full stars but day not ending yet
-      ensurePrizeStarJackpotAfterTutorials();
-      // Re-attempt dual-choice milestone if eligible but previously blocked by a modal
+      ensurePrizeStarJackpotAfterTutorials(); // no-op but kept for compatibility
+      if(pendingStreakJackpot && !document.querySelector('.modal-backdrop')){
+        pendingStreakJackpot = false;
+        if(!prizeStarJackpotPlayedToday){ try { openPrizeStarJackpot(); } catch {} }
+      }
       try { attemptDualChoiceTrigger(); } catch(e){ /* ignore */ }
     }, 60);
   }
@@ -1410,16 +1744,7 @@ function closeModal() {
 }
 
 // If tutorials just ended and player has 5/5 stars, auto open jackpot (once) even mid-day (e.g., after post_move pages finish)
-function ensurePrizeStarJackpotAfterTutorials(){
-  if(prizeStars < 5) return;
-  if(prizeStarJackpotPlayedToday) return;
-  // Don't open over an existing modal
-  if(document.querySelector('.modal-backdrop')) return;
-  // Avoid interrupting chained tutorial flows: if any forced replay pending or tutorial popup would appear next, skip.
-  if(forceReplayPhases.size>0) return;
-  // Heuristic: if no tutorial popup just fired (closeModal path) and stars are full, show jackpot now.
-  openPrizeStarJackpot();
-}
+function ensurePrizeStarJackpotAfterTutorials(){ /* obsolete with 7-key gating; retained as no-op for safety */ }
 
 // Animate a simple travel of 🔑 and ⭐ from player token position to their respective counters
 function triggerMetaTrailAnimation(){
@@ -1656,6 +1981,38 @@ function initDebugOverlay() {
           megaBoxBtn.addEventListener('mouseleave', ()=>{ megaBoxBtn.style.background = '#222'; });
           megaBoxBtn.addEventListener('click', ()=>{ openMegaBoxGameOverlay(); });
           debugButtonsEl.appendChild(megaBoxBtn);
+          // Skip Day (no roll) - advances day as skipped
+          const skipDayBtn = document.createElement('button');
+          skipDayBtn.type='button'; skipDayBtn.textContent='Skip Day';
+          Object.assign(skipDayBtn.style, {
+            cursor:'pointer', background:'#222', color:'#fff', border:'1px solid #444', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'
+          });
+          skipDayBtn.addEventListener('mouseenter', ()=>{ skipDayBtn.style.background = '#333'; });
+          skipDayBtn.addEventListener('mouseleave', ()=>{ skipDayBtn.style.background = '#222'; });
+          skipDayBtn.addEventListener('click', ()=>{
+            // Only allow if current day hasn't been advanced via skip already (ensure rollUsed reset pattern)
+            if(dayState.rollUsed){ transientToast('Can only skip before rolling.'); return; }
+            advanceDayWithTransition(true);
+            updateDebugOverlay();
+          });
+          debugButtonsEl.appendChild(skipDayBtn);
+          // +1 Key & Star (engagement progression)
+          const addKeyBtn = document.createElement('button');
+          addKeyBtn.type='button'; addKeyBtn.textContent='+1 Key+Star';
+          Object.assign(addKeyBtn.style,{cursor:'pointer',background:'#222',color:'#fff',border:'1px solid #444',padding:'4px 8px',borderRadius:'4px',fontSize:'12px',letterSpacing:'0.5px'});
+          addKeyBtn.addEventListener('mouseenter',()=>{ addKeyBtn.style.background='#333'; });
+          addKeyBtn.addEventListener('mouseleave',()=>{ addKeyBtn.style.background='#222'; });
+          addKeyBtn.addEventListener('click',()=>{ awardEngagementProgress(); updateDebugOverlay(); });
+          debugButtonsEl.appendChild(addKeyBtn);
+          // +1 Star only
+          const addStarBtn = document.createElement('button');
+          addStarBtn.type='button'; addStarBtn.textContent='+1 Star';
+          Object.assign(addStarBtn.style,{cursor:'pointer',background:'#222',color:'#fff',border:'1px solid #444',padding:'4px 8px',borderRadius:'4px',fontSize:'12px',letterSpacing:'0.5px'});
+          addStarBtn.addEventListener('mouseenter',()=>{ addStarBtn.style.background='#333'; });
+          addStarBtn.addEventListener('mouseleave',()=>{ addStarBtn.style.background='#222'; });
+          addStarBtn.addEventListener('click',()=>{ addPrizeStars(1); updateCurrencyCounters(); updateDebugOverlay(); });
+          debugButtonsEl.appendChild(addStarBtn);
+          // (Engagement debug panel removed per request)
           // Close button for convenience
           const closeBtn = mkBtn('Close Debug (0)', 'slot');
           closeBtn.removeEventListener('click', ()=>{}); // remove earlier listener
@@ -1698,6 +2055,8 @@ function updateDebugOverlay() {
   `categories: ${catCount} minigames: ${mgCount}\n`+
   `day: ${dayState.day} rollUsed:${dayState.rollUsed} level:${levelState.level}\n`+
   `zone: ${currentZoneId}`;
+  // Also refresh engagement box if present
+  updateEngagementUI();
 }
 
 // ---------------- Minigame Modals ----------------
@@ -1796,10 +2155,9 @@ function completeMinigame(assign:MinigameAssignment, success:boolean, resultEl:H
     const reward = selectReward();
     if(reward.kind==='nothing') msg = '<p><strong>No reward this time.</strong></p>';
     else {
-      applyReward(reward); // applies base reward
-      // Minigame-only meta currency bonus
-      addStreakKeys(1);
-      addPrizeStars(1);
+    applyReward(reward); // applies base reward
+    // Explicit minigame engagement awards
+  awardEngagementProgress();
       updateCurrencyCounters();
       msg = `<p><strong>Reward:</strong> ${reward.label}</p>${formatMetaBonusLine()}`;
       pendingMetaTrail = true;
@@ -1826,9 +2184,8 @@ function finalizeMinigameManual(assign:MinigameAssignment, reward:Reward|null, r
     if(reward.kind==='nothing'){
       msg = '<p><strong>No reward this time.</strong></p>';
     } else {
-      applyReward(reward);
-      addStreakKeys(1);
-      addPrizeStars(1);
+    applyReward(reward);
+  awardEngagementProgress();
       updateCurrencyCounters();
       msg = `<p><strong>Reward:</strong> ${reward.label}</p>${formatMetaBonusLine()}`;
       pendingMetaTrail = true;
@@ -2128,11 +2485,13 @@ function renderDice() {
     bar = document.createElement('div');
     bar.className = 'dice-bar';
     bar.innerHTML = `
-      <div class="dice-wrapper" style="display:flex;align-items:center;justify-content:center;">
+      <div class="dice-wrapper" style="display:flex;align-items:center;justify-content:center;gap:10px;">
         <button type="button" class="dice-cube dice-roll-btn" aria-label="Roll Dice" title="Roll Dice">-</button>
+        <button type="button" class="skip-day-btn" title="Skip this day" style="display:none;padding:10px 14px;border-radius:14px;border:2px solid #55606c;background:#202830;color:#fff;font-weight:600;letter-spacing:.5px;cursor:pointer;font-size:12px;">Skip Day</button>
       </div>`;
     document.getElementById('app')?.appendChild(bar);
-    const rollBtn = bar.querySelector('.dice-roll-btn') as HTMLButtonElement;
+  const rollBtn = bar.querySelector('.dice-roll-btn') as HTMLButtonElement;
+  const skipBtn = bar.querySelector('.skip-day-btn') as HTMLButtonElement;
     const sharedFace = rollBtn; // rolled value appears on the dice itself
     // Style injection for dice if missing
     if(!document.getElementById('dice-style')){
@@ -2173,6 +2532,15 @@ function renderDice() {
         }
       }, 80);
     });
+    // Skip button logic
+    function refreshSkip(){
+      if(isTutorialActive(dayState.day) || dayState.rollUsed){ skipBtn.style.display='none'; }
+      else skipBtn.style.display='inline-block';
+    }
+    skipBtn.addEventListener('click', ()=>{
+      if(isTutorialActive(dayState.day)) return; if(dayState.rollUsed) return; advanceDayWithTransition(true);
+    });
+    setInterval(refreshSkip, 700);
   }
 }
 
@@ -2265,8 +2633,11 @@ function openInstantTokensModal(assign:CategoryAssignment){
   const amount = randInt(10,50);
   addTokens(amount);
   // Meta bonus (instant rewards now also grant key & star)
-  addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
+  // Removed incidental key/star grants to preserve mirroring; only engagement progression updates them
+  pendingMetaTrail = true;
   assign.completed = true; saveCategoryAssignments(); refreshStates();
+  // Grant streak key + prize star for engagement progression on instant tokens tile
+  awardEngagementProgress();
   openInfoModal('Instant Tokens', `<p>You received <strong>${amount} Tokens</strong>.</p>${formatMetaBonusLine()}` , ()=>{ 
     const wasPending = pendingPostInstantWinPhase; 
     maybeQueuePostInstantWinPhase(); 
@@ -2299,8 +2670,11 @@ function openInstantPrizeModal(assign:CategoryAssignment){
     const prize = randomInstantPrize(); prize.apply(); label = prize.label;
   }
   // Meta bonus
-  addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
+  // Removed incidental key/star grants to preserve mirroring; only engagement progression updates them
+  pendingMetaTrail = true;
   assign.completed = true; saveCategoryAssignments(); refreshStates();
+  // Engagement progression
+  awardEngagementProgress();
   openInfoModal('Instant Prize', `<p>You won <strong>${label}</strong>.</p>${formatMetaBonusLine()}` , ()=>{ 
     const wasPending = pendingPostInstantWinPhase; 
     maybeQueuePostInstantWinPhase(); 
@@ -2310,8 +2684,10 @@ function openInstantPrizeModal(assign:CategoryAssignment){
 
 function openBonusRoundModal(assign:CategoryAssignment){
   const prize = randomBonusRoundPrize(); // already applied
-  addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
+  // Removed incidental key/star grants to preserve mirroring; only engagement progression updates them
+  pendingMetaTrail = true;
   assign.completed = true; saveCategoryAssignments(); refreshStates();
+  awardEngagementProgress();
   openInfoModal('BONUS ROUND', `<p><strong>${prize.label}</strong></p>${formatMetaBonusLine()}` , ()=>{ 
     const wasPending = pendingPostBonusRoundPhase; 
     maybeQueuePostBonusRoundPhase(); 
@@ -2328,8 +2704,10 @@ function openRevealModal(assign:CategoryAssignment){
   // Simplified: direct reveal (pick-1-of-3 removed)
   closeModal();
   const reward = randomInstantPrize(); reward.apply();
-  addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
+  // Removed incidental key/star grants to preserve mirroring; only engagement progression updates them
+  pendingMetaTrail = true;
   assign.completed = true; saveCategoryAssignments(); refreshStates();
+  awardEngagementProgress();
   openInfoModal('Reveal', `<p>You uncovered <strong>${reward.label}</strong>.</p>${formatMetaBonusLine()}` , ()=>{ 
     const wasPending = pendingPostInstantWinPhase; 
     maybeQueuePostInstantWinPhase(); 
@@ -2412,7 +2790,7 @@ function ensureDayFader(){
   }
   return el as HTMLDivElement;
 }
-function advanceDayWithTransition(){
+function advanceDayWithTransition(skipped:boolean=false){
   const fader = ensureDayFader();
   fader.style.pointerEvents='auto';
   const labelId = 'day-fader-label';
@@ -2427,9 +2805,15 @@ function advanceDayWithTransition(){
   // After fade-in completes, increment day, show label for 3s, then fade out.
   const prevDay = dayState.day;
   setTimeout(()=>{
-    // Legacy streak removed; maintain streakKeys reset if roll not used
-    if(!dayState.rollUsed && streakKeys !== 0){ streakKeys = 0; saveCurrencies(); }
-    maybeApplyTutorialPopups('end_day');
+  // Removed auto-clear of streakKeys when no roll used; keys persist independently now.
+  // Engagement update only if played (rolled) and not skipped
+  if(!skipped && dayState.rollUsed){ updateEngagementOnCompletedDay(); }
+  else if(skipped){
+    resetConsecutive();
+    // On skipping a day, streak keys should be forfeited
+    if(streakKeys>0){ streakKeys = 0; saveCurrencies(); updateCurrencyCounters(); }
+  }
+  maybeApplyTutorialPopups('end_day');
   dayState.day += 1; dayState.rollUsed = false; saveDayState();
   // Reset per-day jackpot flag so a new 5/5 can trigger today (post-tutorial cycle)
   if(typeof prizeStarJackpotPlayedToday !== 'undefined') prizeStarJackpotPlayedToday = false;
@@ -2622,11 +3006,7 @@ function evaluateDayCompletion(){
     }
   }
   // Check prize star jackpot before enabling next day if threshold met and not yet played today
-  if(prizeStars >=5 && !prizeStarJackpotPlayedToday){
-    // Launch jackpot overlay (defer actual next-day button swap until after overlay)
-    openPrizeStarJackpot();
-    return;
-  }
+  // Jackpot trigger no longer tied to prizeStars count; handled on 7-day completion.
   // Swap dice for next-day button if not already swapped
   const diceBtn = document.querySelector('.dice-roll-btn') as HTMLButtonElement | null;
   if(diceBtn && diceBtn.parentElement){
@@ -2655,6 +3035,8 @@ const originalUpdateDayUI = updateDayUI;
 
 // Prize Star Jackpot (5/5) -------------------------------------------------
 let prizeStarJackpotPlayedToday = false;
+let pendingStreakJackpot = false; // defer 7-day jackpot if blocked by tutorial/modal
+function isAnyModalActive(){ return !!document.querySelector('.modal-backdrop'); }
 function openPrizeStarJackpot(){
   if(prizeStarJackpotPlayedToday) return;
   prizeStarJackpotPlayedToday = true;
@@ -2669,7 +3051,8 @@ function openPrizeStarJackpot(){
       { boxShadow:'0 0 0 0 rgba(255,159,67,0.0)' }
     ],{ duration:1400, easing:'ease' });
   }
-  setTimeout(()=> showPrizeStarJackpotOverlay(), 600);
+  // Show immediately (no delay) and ensure it overlays any existing content
+  showPrizeStarJackpotOverlay();
 }
 
 function showPrizeStarJackpotOverlay(){
@@ -2677,18 +3060,19 @@ function showPrizeStarJackpotOverlay(){
   const backdrop = document.createElement('div');
   backdrop.className='modal-backdrop jackpot-backdrop';
   backdrop.style.backdropFilter='blur(4px)';
+  backdrop.style.zIndex='12000'; // ensure above any other modal
   const modal = document.createElement('div');
   modal.className='modal jackpot-modal';
   modal.style.maxWidth='640px';
   modal.style.width='100%';
-  modal.innerHTML = `<h2 style='text-align:center;margin-bottom:8px;'>Prize Star Bonus Game</h2>
-    <p style='text-align:center;margin:0 0 18px;font-size:14px;line-height:1.5;'>Scratch 3 panels to reveal your guaranteed big reward!</p>
+  modal.style.zIndex='12001';
+  modal.innerHTML = `<h2 style='text-align:center;margin-bottom:8px;'>Streak Jackpot</h2>
+    <p style='text-align:center;margin:0 0 18px;font-size:14px;line-height:1.5;'>Scratch 3 panels to reveal your guaranteed big reward! (Closes automatically)</p>
     <div class='scratch-grid' style='display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 auto 20px;max-width:420px;'></div>
-    <div class='jackpot-result' style='text-align:center;font-weight:600;font-size:16px;min-height:32px;'></div>
-    <div class='modal-footer' style='justify-content:center;'><button class='primary jackpot-close' type='button' disabled>Close</button></div>`;
+    <div class='jackpot-result' style='text-align:center;font-weight:600;font-size:16px;min-height:32px;'></div>`;
   const grid = modal.querySelector('.scratch-grid') as HTMLDivElement;
   const resultEl = modal.querySelector('.jackpot-result') as HTMLDivElement;
-  const closeBtn = modal.querySelector('.jackpot-close') as HTMLButtonElement;
+  const closeBtn: HTMLButtonElement | null = null; // removed manual close; auto close after reward
   const rewards = [
     { kind:'freePlays', amount:10, label:'10 Free Plays' },
     { kind:'bonus', amount:1000, label:'£10 Bonus Money' },
@@ -2720,7 +3104,7 @@ function showPrizeStarJackpotOverlay(){
           if(revealed===3){
             // Choose one of the revealed rewards as final prize
             chosenReward = r; // deterministic last one picked acts as prize (simplify)
-            finalizeJackpotReward(chosenReward, resultEl, closeBtn);
+            finalizeJackpotReward(chosenReward, resultEl);
           }
         } else {
           btn.textContent='—';
@@ -2735,34 +3119,26 @@ function showPrizeStarJackpotOverlay(){
   }
   backdrop.appendChild(modal); document.body.appendChild(backdrop);
   document.body.classList.add('modal-open');
-  closeBtn.addEventListener('click',()=>{
-    if(closeBtn.disabled) return;
-    // Reset prize stars back to zero after awarding
-    prizeStars = 0; saveCurrencies(); updateCurrencyCounters();
-    // Level up player once when completing jackpot (clamp to LEVEL_COUNT)
-    if(levelState.level < LEVEL_COUNT){
-      levelState.level += 1; saveLevelState(); updateLevelUI();
-    }
-    // Visual glow on progress bar to show level gain triggered from jackpot
-    try {
-      const bar = document.querySelector('.prize-star-progress');
-      if(bar){
-        bar.classList.remove('ps-level-up'); // reset if still applied
-        void (bar as HTMLElement).offsetWidth; // force reflow for restart
-        bar.classList.add('ps-level-up');
-        setTimeout(()=> bar.classList.remove('ps-level-up'), 1800);
-      }
-    } catch(e){ /* non-fatal */ }
-    closeModal(); // remove jackpot modal
-    evaluateDayCompletion(); // continue normal flow (next-day button etc.)
-  });
 }
 
-function finalizeJackpotReward(r:Reward, resultEl:HTMLDivElement, closeBtn:HTMLButtonElement){
-  // Apply the reward (guaranteed win) and show message
+function finalizeJackpotReward(r:Reward, resultEl:HTMLDivElement){
   applyReward(r);
   resultEl.innerHTML = `<p><strong>Congrats!</strong> You won ${r.label}!</p>`;
-  closeBtn.disabled = false;
+  // Reset engagement currencies now (only here, not when hitting 7-day threshold)
+  prizeStars = 0;
+  streakKeys = 0; // streak keys intentionally held between awardSevenDay and the end of the jackpot
+  saveCurrencies(); updateCurrencyCounters();
+  // Allow future jackpots this (new) day after completion if streak builds again
+  prizeStarJackpotPlayedToday = false;
+  if(levelState.level < LEVEL_COUNT){ levelState.level += 1; saveLevelState(); updateLevelUI(); }
+  try {
+    const bar = document.querySelector('.prize-star-progress');
+    if(bar){
+      bar.classList.remove('ps-level-up'); void (bar as HTMLElement).offsetWidth; bar.classList.add('ps-level-up');
+      setTimeout(()=> bar.classList.remove('ps-level-up'), 1800);
+    }
+  } catch{}
+  setTimeout(()=>{ closeModal(); evaluateDayCompletion(); }, 1400);
 }
 
 // ================= 120 Token Dual Choice Overlay & Games =================

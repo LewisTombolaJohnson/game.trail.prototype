@@ -1991,37 +1991,19 @@ function initDebugOverlay() {
           megaBoxBtn.addEventListener('mouseleave', ()=>{ megaBoxBtn.style.background = '#222'; });
           megaBoxBtn.addEventListener('click', ()=>{ openMegaBoxGameOverlay(); });
           debugButtonsEl.appendChild(megaBoxBtn);
-<<<<<<< HEAD
-          // Token adjust buttons (+10 / -10)
-          const tokenPlusBtn = document.createElement('button');
-          tokenPlusBtn.type='button'; tokenPlusBtn.textContent='+10 Tokens';
-          Object.assign(tokenPlusBtn.style, { cursor:'pointer', background:'#224422', color:'#fff', border:'1px solid #2d6b2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
-          tokenPlusBtn.addEventListener('mouseenter', ()=>{ tokenPlusBtn.style.background='#2d5d2d'; });
-          tokenPlusBtn.addEventListener('mouseleave', ()=>{ tokenPlusBtn.style.background='#224422'; });
-          tokenPlusBtn.addEventListener('click', ()=>{ addTokens(10); updateCurrencyCounters(); });
-          debugButtonsEl.appendChild(tokenPlusBtn);
-          const tokenMinusBtn = document.createElement('button');
-          tokenMinusBtn.type='button'; tokenMinusBtn.textContent='-10 Tokens';
-          Object.assign(tokenMinusBtn.style, { cursor:'pointer', background:'#442222', color:'#fff', border:'1px solid #6b2d2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
-          tokenMinusBtn.addEventListener('mouseenter', ()=>{ tokenMinusBtn.style.background='#5d2d2d'; });
-          tokenMinusBtn.addEventListener('mouseleave', ()=>{ tokenMinusBtn.style.background='#442222'; });
-          tokenMinusBtn.addEventListener('click', ()=>{ tokens = Math.max(0, tokens - 10); saveCurrencies(); updateCurrencyCounters(); });
-          debugButtonsEl.appendChild(tokenMinusBtn);
-=======
           // Skip Day (no roll) - advances day as skipped
           const skipDayBtn = document.createElement('button');
           skipDayBtn.type='button'; skipDayBtn.textContent='Skip Day';
           Object.assign(skipDayBtn.style, {
             cursor:'pointer', background:'#222', color:'#fff', border:'1px solid #444', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'
           });
-          skipDayBtn.addEventListener('mouseenter', ()=>{ skipDayBtn.style.background = '#333'; });
-          skipDayBtn.addEventListener('mouseleave', ()=>{ skipDayBtn.style.background = '#222'; });
-          skipDayBtn.addEventListener('click', ()=>{
-            // Only allow if current day hasn't been advanced via skip already (ensure rollUsed reset pattern)
-            if(dayState.rollUsed){ transientToast('Can only skip before rolling.'); return; }
-            advanceDayWithTransition(true);
-            updateDebugOverlay();
-          });
+            skipDayBtn.addEventListener('mouseenter', ()=>{ skipDayBtn.style.background = '#333'; });
+            skipDayBtn.addEventListener('mouseleave', ()=>{ skipDayBtn.style.background = '#222'; });
+            skipDayBtn.addEventListener('click', ()=>{
+              if(dayState.rollUsed){ transientToast('Can only skip before rolling.'); return; }
+              advanceDayWithTransition(true);
+              updateDebugOverlay();
+            });
           debugButtonsEl.appendChild(skipDayBtn);
           // +1 Key & Star (engagement progression)
           const addKeyBtn = document.createElement('button');
@@ -2039,8 +2021,22 @@ function initDebugOverlay() {
           addStarBtn.addEventListener('mouseleave',()=>{ addStarBtn.style.background='#222'; });
           addStarBtn.addEventListener('click',()=>{ addPrizeStars(1); updateCurrencyCounters(); updateDebugOverlay(); });
           debugButtonsEl.appendChild(addStarBtn);
+          // Token adjust buttons (+10 / -10)
+          const tokenPlusBtn = document.createElement('button');
+          tokenPlusBtn.type='button'; tokenPlusBtn.textContent='+10 Tokens';
+          Object.assign(tokenPlusBtn.style, { cursor:'pointer', background:'#224422', color:'#fff', border:'1px solid #2d6b2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
+          tokenPlusBtn.addEventListener('mouseenter', ()=>{ tokenPlusBtn.style.background='#2d5d2d'; });
+          tokenPlusBtn.addEventListener('mouseleave', ()=>{ tokenPlusBtn.style.background='#224422'; });
+          tokenPlusBtn.addEventListener('click', ()=>{ addTokens(10); updateCurrencyCounters(); });
+          debugButtonsEl.appendChild(tokenPlusBtn);
+          const tokenMinusBtn = document.createElement('button');
+          tokenMinusBtn.type='button'; tokenMinusBtn.textContent='-10 Tokens';
+          Object.assign(tokenMinusBtn.style, { cursor:'pointer', background:'#442222', color:'#fff', border:'1px solid #6b2d2d', padding:'4px 8px', borderRadius:'4px', fontSize:'12px', letterSpacing:'0.5px'});
+          tokenMinusBtn.addEventListener('mouseenter', ()=>{ tokenMinusBtn.style.background='#5d2d2d'; });
+          tokenMinusBtn.addEventListener('mouseleave', ()=>{ tokenMinusBtn.style.background='#442222'; });
+          tokenMinusBtn.addEventListener('click', ()=>{ tokens = Math.max(0, tokens - 10); saveCurrencies(); updateCurrencyCounters(); });
+          debugButtonsEl.appendChild(tokenMinusBtn);
           // (Engagement debug panel removed per request)
->>>>>>> 5ff0c1b (build: production build and feature updates (safe game, jackpot fixes, milestones))
           // Close button for convenience
           const closeBtn = mkBtn('Close Debug (0)', 'slot');
           closeBtn.removeEventListener('click', ()=>{}); // remove earlier listener
@@ -2758,31 +2754,21 @@ function openInstantPrizeModal(assign:CategoryAssignment){
 }
 
 function openBonusRoundModal(assign:CategoryAssignment){
-<<<<<<< HEAD
   const plan = getTutorialPlanForDay(dayState.day);
   let prize = randomBonusRoundPrize(); // already applied
   if(plan && plan.day===3 && (plan as any).forceBonusNoTokens){
-    // If the randomly selected prize contains 'Token' text, re-roll until non-token (safety cap to avoid infinite loop)
-    let guard = 0;
-    while(/Token/i.test(prize.label) && guard < 10){
-      prize = randomBonusRoundPrize();
-      guard++;
-    }
+    let guard=0;
+    while(/Token/i.test(prize.label) && guard<10){ prize = randomBonusRoundPrize(); guard++; }
     if(/Token/i.test(prize.label)){
-      // Fallback: forcibly grant a Free Plays or Bonus reward
-      addFreePlays(1);
-      prize = { label: '1 Free Play', apply:()=>{} } as any;
+      addFreePlays(1); prize = { label:'1 Free Play', apply:()=>{} } as any;
       console.debug('[Tutorial][Day3][BonusRound] Forced fallback Free Play to avoid token prize.');
     } else {
       console.debug('[Tutorial][Day3][BonusRound] Ensured non-token prize:', prize.label);
     }
   }
-  addStreakKeys(1); addPrizeStars(1); pendingMetaTrail = true;
-=======
-  const prize = randomBonusRoundPrize(); // already applied
-  // Removed incidental key/star grants to preserve mirroring; only engagement progression updates them
   pendingMetaTrail = true;
->>>>>>> 5ff0c1b (build: production build and feature updates (safe game, jackpot fixes, milestones))
+  // Standard engagement progression
+  awardEngagementProgress();
   assign.completed = true; saveCategoryAssignments(); refreshStates();
   awardEngagementProgress();
   openInfoModal('BONUS ROUND', `<p><strong>${prize.label}</strong></p>${formatMetaBonusLine()}` , ()=>{ 

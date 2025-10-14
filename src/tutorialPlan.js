@@ -10,6 +10,8 @@ export const TUTORIAL_DAYS = [
         forcedDice: 4,
         targetLevel: 5,
         reward: { kind: 'minigame', minigame: 'lootbox', forceLootboxAmount: 50, forceLootboxKind: 'bonus', notes: 'Fixed starter 50p bonus to demonstrate bonus currency.' },
+        // Ensure the landed tile behaves as a minigame tile so we actually open the lootbox rather than whatever random category level 5 received.
+        forceLandingCategory: 'minigame',
         autoTriggerCategory: true,
         overrideZone: 'carnival',
         designerNotes: 'Introduce movement + UI.',
@@ -39,6 +41,8 @@ export const TUTORIAL_DAYS = [
         targetLevel: 11,
         // Award 2 free plays explicitly on day 2
         reward: { kind: 'freePlays', amount: 2, notes: 'Two Free Plays to showcase multi-award.' },
+        // Guarantee the tile behaves as an instant prize (not tokens) so we can deterministically award 2 Free Plays.
+        forceLandingCategory: 'instant_prize',
         overrideZone: 'carnival',
         designerNotes: 'Highlight progress & level nodes.',
         popups: {
@@ -54,16 +58,19 @@ export const TUTORIAL_DAYS = [
         day: 3,
         forcedDice: 3,
         targetLevel: 14,
-        reward: { kind: 'bonus', notes: 'Introduce bonus round concept.' },
+        // Revert to bonus round category for tile landing, but we will trigger Mega Box overlay (existing game) instead of the legacy bonus popup.
+        reward: { kind: 'bonus', notes: 'Introduce choice game (Mega Box) using existing overlay.' },
         overrideZone: 'carnival',
         forceLandingCategory: 'bonus_round',
-        designerNotes: 'Introduce concept of prizes.',
+        autoTriggerCategory: true,
+        designerNotes: 'Introduce concept of prizes via Mega Box (existing 12-box game).',
         popups: {
-            start_day: "<p>Hey again partner! You don’t mind me calling you that right? See that box on the path? That’s a bonus game, wouldn’t it be cool if we landed on it?</p>",
-            post_move: "<p>You did it! Time for a bonus round! In this game it’s just you vs the banker!</p>",
-            post_bonus_round: [
-                "<p>Whew, that was fun! Bonus games are great ways to receive bigger wins! Don’t forget your key and prize star too</p>",
-                "<p>This isn’t the only place you can play Deal or No Deal. If you enjoyed that, why not check out our other Deal or No Deal games</p>"
+            start_day: "<p>Hey again partner! See that special prize game up ahead? Let’s land on it!</p>",
+            post_move: "<p>You did it! Time to play the Mega Box game!</p>",
+            pre_minigame: ["<p>Pick a box to keep, eliminate the rest, then decide if you want to switch at the end.</p>"],
+            post_minigame: [
+                "<p>Exciting! That tension really builds. You also collected your key and prize star.</p>",
+                "<p>Come back tomorrow for more!</p>"
             ]
         }
     },
